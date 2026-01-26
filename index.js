@@ -1095,5 +1095,11 @@ function bindSettingsEvents() {
     // CHARACTER_MESSAGE_RENDERED fires after addOneMessage() completes
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, onMessageReceived);
     
+    // Also handle swipes - when user swipes to a different AI response
+    context.eventSource.on(context.event_types.MESSAGE_SWIPED, onMessageReceived);
+    
+    // Handle message updates (edits)
+    context.eventSource.on(context.event_types.MESSAGE_UPDATED, onMessageReceived);
+    
     console.log('[IIG] Inline Image Generation extension initialized');
 })();
