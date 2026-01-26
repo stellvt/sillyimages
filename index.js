@@ -21,13 +21,15 @@ const defaultSettings = Object.freeze({
     // Nano-banana specific
     sendCharAvatar: false,
     sendUserAvatar: false,
+    aspectRatio: '1:1', // "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+    imageSize: '1K', // "1K", "2K", "4K"
 });
 
 // Image model detection keywords (from your api_client.py)
 const IMAGE_MODEL_KEYWORDS = [
     'dall-e', 'midjourney', 'mj', 'journey', 'stable-diffusion', 'sdxl', 'flux',
     'imagen', 'drawing', 'paint', 'image', 'seedream', 'hidream', 'dreamshaper',
-    'ideogram', 'nano-banana', 'gemini-3-pro', 'gpt-image', 'wanx', 'qwen'
+    'ideogram', 'nano-banana', 'gpt-image', 'wanx', 'qwen'
 ];
 
 // Video model keywords to exclude
@@ -67,7 +69,7 @@ function isImageModel(modelId) {
  */
 function isGeminiModel(modelId) {
     const mid = modelId.toLowerCase();
-    return mid.includes('gemini-3-pro') || mid.includes('nano-banana');
+    return mid.includes('nano-banana');
 }
 
 /**
@@ -371,14 +373,14 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1beta/models/${model}:generateContent`;
     
     // Determine aspect ratio: tag option > settings
-    let aspectRatio = options.aspectRatio || '1:1';
-    if (!options.aspectRatio) {
-        // Fallback to settings size
-        if (settings.size === '1024x1792' || settings.size === '768x1344') aspectRatio = '9:16';
-        else if (settings.size === '1792x1024' || settings.size === '1344x768') aspectRatio = '16:9';
-    }
+    // Supported: "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+    const aspectRatio = options.aspectRatio || settings.aspectRatio || '1:1';
     
-    console.log(`[IIG] Using aspect ratio: ${aspectRatio}`);
+    // Determine image size: tag option > settings
+    // Supported: "1K", "2K", "4K" (default 1K)
+    const imageSize = options.imageSize || settings.imageSize || '1K';
+    
+    console.log(`[IIG] Using aspect ratio: ${aspectRatio}, image size: ${imageSize}`);
     
     // Build parts array
     const parts = [];
@@ -414,7 +416,8 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
         generationConfig: {
             responseModalities: ['TEXT', 'IMAGE'],
             imageConfig: {
-                aspectRatio: aspectRatio
+                aspectRatio: aspectRatio,
+                imageSize: imageSize
             }
         }
     };
@@ -646,7 +649,8 @@ function parseImageTags(text) {
                 index: markerIndex,
                 style: data.style || '',
                 prompt: data.prompt || '',
-                aspectRatio: data.aspect_ratio || data.aspectRatio || null, // e.g. "16:9", "9:16", "1:1"
+                aspectRatio: data.aspect_ratio || data.aspectRatio || null, // "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+                imageSize: data.image_size || data.imageSize || null, // "1K", "2K", "4K"
                 quality: data.quality || null, // e.g. "hd", "standard"
                 isInImgSrc: isInImgSrc // Flag for replacement logic
             });
@@ -721,7 +725,7 @@ async function retryGeneration(placeholder, tagInfo) {
             tagInfo.prompt,
             tagInfo.style,
             (status) => { statusEl.textContent = status; },
-            { aspectRatio: tagInfo.aspectRatio, quality: tagInfo.quality }
+            { aspectRatio: tagInfo.aspectRatio, imageSize: tagInfo.imageSize, quality: tagInfo.quality }
         );
         
         // Save image to file
@@ -848,7 +852,7 @@ async function processMessageTags(messageId) {
                 tag.prompt,
                 tag.style,
                 (status) => { statusEl.textContent = status; },
-                { aspectRatio: tag.aspectRatio, quality: tag.quality }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality }
             );
             
             // Save image to file instead of keeping base64
@@ -1031,9 +1035,40 @@ function createSettingsUI() {
                     
                     <hr>
                     
-                    <!-- Опции аватарок для Nano-Banana -->
+                    <!-- Опции для Nano-Banana -->
                     <div id="iig_avatar_section" class="iig-avatar-section ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
-                        <h4>Аватарки персонажей (Nano-Banana)</h4>
+                        <h4>Настройки Nano-Banana</h4>
+                        
+                        <!-- Aspect Ratio -->
+                        <div class="flex-row">
+                            <label for="iig_aspect_ratio">Соотношение сторон</label>
+                            <select id="iig_aspect_ratio" class="flex1">
+                                <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
+                                <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
+                                <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
+                                <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
+                                <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
+                                <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
+                                <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
+                                <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
+                                <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
+                                <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
+                            </select>
+                        </div>
+                        
+                        <!-- Image Size -->
+                        <div class="flex-row">
+                            <label for="iig_image_size">Разрешение</label>
+                            <select id="iig_image_size" class="flex1">
+                                <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
+                                <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
+                                <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
+                            </select>
+                        </div>
+                        
+                        <hr>
+                        
+                        <h5>Референсы</h5>
                         <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
                         
                         <label class="checkbox_label">
@@ -1176,6 +1211,18 @@ function bindSettingsEvents() {
     // Quality
     document.getElementById('iig_quality')?.addEventListener('change', (e) => {
         settings.quality = e.target.value;
+        saveSettings();
+    });
+    
+    // Aspect Ratio (nano-banana)
+    document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => {
+        settings.aspectRatio = e.target.value;
+        saveSettings();
+    });
+    
+    // Image Size (nano-banana)
+    document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
+        settings.imageSize = e.target.value;
         saveSettings();
     });
     
