@@ -658,13 +658,13 @@ async function processMessageTags(messageId) {
     if (tags.length === 0) return;
     
     console.log(`[IIG] Found ${tags.length} image tag(s) in message ${messageId}`);
+    toastr.info(`Найдено тегов: ${tags.length}. Генерация...`, 'Генерация картинок', { timeOut: 3000 });
     
-    // Wait for message to render
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
+    // DOM is ready because we use CHARACTER_MESSAGE_RENDERED event
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!messageElement) {
-        console.warn('[IIG] Message element not found');
+        console.error('[IIG] Message element not found for ID:', messageId);
+        toastr.error('Не удалось найти элемент сообщения', 'Генерация картинок');
         return;
     }
     
@@ -716,6 +716,7 @@ async function processMessageTags(messageId) {
             message.mes = message.mes.replace(tag.fullMatch, `![${tag.prompt}](${imageUrl})`);
             
             console.log(`[IIG] Successfully generated image for tag ${index}`);
+            toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
         } catch (error) {
             console.error(`[IIG] Failed to generate image for tag ${index}:`, error);
             
@@ -735,14 +736,12 @@ async function processMessageTags(messageId) {
 }
 
 /**
- * Handle MESSAGE_RECEIVED event
+ * Handle CHARACTER_MESSAGE_RENDERED event
+ * This fires AFTER the message is rendered to DOM
  */
 async function onMessageReceived(messageId) {
     const settings = getSettings();
     if (!settings.enabled) return;
-    
-    // Small delay to ensure message is in chat array
-    await new Promise(resolve => setTimeout(resolve, 50));
     
     await processMessageTags(messageId);
 }
@@ -1030,8 +1029,9 @@ function bindSettingsEvents() {
         console.log('[IIG] Inline Image Generation extension loaded');
     });
     
-    // Listen for new messages
-    context.eventSource.on(context.event_types.MESSAGE_RECEIVED, onMessageReceived);
+    // Listen for new messages AFTER they're rendered in DOM
+    // CHARACTER_MESSAGE_RENDERED fires after addOneMessage() completes
+    context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, onMessageReceived);
     
     console.log('[IIG] Inline Image Generation extension initialized');
 })();
