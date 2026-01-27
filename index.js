@@ -54,7 +54,7 @@ const defaultSettings = Object.freeze({
     model: '',
     size: '1024x1024',
     quality: 'standard',
-    maxRetries: 3,
+    maxRetries: 0, // No auto-retry - user clicks error image to retry manually
     retryDelay: 1000,
     // Nano-banana specific
     sendCharAvatar: false,
