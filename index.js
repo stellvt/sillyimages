@@ -602,16 +602,33 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
 }
 
 /**
+ * Check if a file exists on the server
+ */
+async function checkFileExists(path) {
+    try {
+        const response = await fetch(path, { method: 'HEAD' });
+        return response.ok;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
  * Parse image generation tags from message text
  * Supports two formats:
  * 1. NEW: <img instruction='{"style":"...","prompt":"..."}' src="[IMG:GEN]">
  * 2. LEGACY: [IMG:GEN:{"style":"...","prompt":"..."}]
+ * 
+ * @param {string} text - Message text
+ * @param {object} options - Options
+ * @param {boolean} options.checkExistence - Check if image files exist (for hallucination detection)
+ * @param {boolean} options.forceAll - Include all instruction tags even with valid paths (for regeneration)
  */
-function parseImageTags(text) {
+async function parseImageTags(text, options = {}) {
+    const { checkExistence = false, forceAll = false } = options;
     const tags = [];
     
     // === NEW FORMAT: <img instruction="{...}" src="[IMG:GEN]"> ===
-    // Match <img tags with instruction attribute and src containing [IMG:GEN] or empty
     const imgTagRegex = /<img\s+[^>]*instruction\s*=\s*(['"])([\s\S]*?)\1[^>]*>/gi;
     let imgMatch;
     
@@ -619,15 +636,39 @@ function parseImageTags(text) {
         const fullImgTag = imgMatch[0];
         const instructionJson = imgMatch[2];
         
-        // Check if src needs generation (contains [IMG:GEN] or is empty)
+        // Check if src needs generation
         const srcMatch = fullImgTag.match(/src\s*=\s*(['"])([\s\S]*?)\1/i);
         const srcValue = srcMatch ? srcMatch[2] : '';
         
-        // Skip if src is already a real path (generated image)
-        if (srcValue && !srcValue.includes('[IMG:GEN]') && !srcValue.includes('[IMG:') && srcValue.length > 5) {
-            iigLog('INFO', `Skipping already generated image: ${srcValue.substring(0, 50)}`);
+        // Determine if this needs generation
+        let needsGeneration = false;
+        const hasMarker = srcValue.includes('[IMG:GEN]') || srcValue.includes('[IMG:');
+        const hasPath = srcValue && srcValue.startsWith('/') && srcValue.length > 5;
+        
+        if (forceAll) {
+            // Regeneration mode: include all tags with instruction
+            needsGeneration = true;
+            iigLog('INFO', `Force regeneration mode: including ${srcValue.substring(0, 30)}`);
+        } else if (hasMarker || !srcValue) {
+            // Explicit marker or empty src = needs generation
+            needsGeneration = true;
+        } else if (hasPath && checkExistence) {
+            // Has a path - check if file actually exists
+            const exists = await checkFileExists(srcValue);
+            if (!exists) {
+                // File doesn't exist = LLM hallucinated the path
+                iigLog('WARN', `File does not exist (LLM hallucination?): ${srcValue}`);
+                needsGeneration = true;
+            } else {
+                iigLog('INFO', `Skipping existing image: ${srcValue.substring(0, 50)}`);
+            }
+        } else if (hasPath) {
+            // Has path but not checking existence - skip
+            iigLog('INFO', `Skipping path (no existence check): ${srcValue.substring(0, 50)}`);
             continue;
         }
+        
+        if (!needsGeneration) continue;
         
         try {
             // Normalize JSON: AI sometimes uses single quotes, HTML entities, etc.
@@ -647,7 +688,8 @@ function parseImageTags(text) {
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
-                isNewFormat: true // Flag for replacement logic
+                isNewFormat: true,
+                existingSrc: hasPath ? srcValue : null // Store existing src for logging
             });
             
             iigLog('INFO', `Found NEW format tag: ${data.prompt?.substring(0, 50)}`);
@@ -849,7 +891,8 @@ async function processMessageTags(messageId) {
     const message = context.chat[messageId];
     if (!message || message.is_user) return;
     
-    const tags = parseImageTags(message.mes);
+    // Check for tags, with file existence check to catch LLM hallucinations
+    const tags = await parseImageTags(message.mes, { checkExistence: true });
     iigLog('INFO', `parseImageTags returned: ${tags.length} tags`);
     if (tags.length > 0) {
         iigLog('INFO', `First tag: ${JSON.stringify(tags[0]).substring(0, 200)}`);
@@ -1029,22 +1072,130 @@ async function processMessageTags(messageId) {
 }
 
 /**
+ * Regenerate all images in a message (user-triggered)
+ */
+async function regenerateMessageImages(messageId) {
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageId];
+    
+    if (!message) {
+        toastr.error('Сообщение не найдено', 'Генерация картинок');
+        return;
+    }
+    
+    // Parse ALL instruction tags, forcing regeneration
+    const tags = await parseImageTags(message.mes, { forceAll: true });
+    
+    if (tags.length === 0) {
+        toastr.warning('Нет тегов для перегенерации', 'Генерация картинок');
+        return;
+    }
+    
+    iigLog('INFO', `Regenerating ${tags.length} images in message ${messageId}`);
+    toastr.info(`Перегенерация ${tags.length} картинок...`, 'Генерация картинок');
+    
+    // Process using existing logic
+    processingMessages.add(messageId);
+    
+    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (!messageElement) {
+        processingMessages.delete(messageId);
+        return;
+    }
+    
+    const mesTextEl = messageElement.querySelector('.mes_text');
+    if (!mesTextEl) {
+        processingMessages.delete(messageId);
+        return;
+    }
+    
+    for (let index = 0; index < tags.length; index++) {
+        const tag = tags[index];
+        const tagId = `iig-regen-${messageId}-${index}`;
+        
+        try {
+            // Find the existing img element with this instruction
+            const existingImg = mesTextEl.querySelector(`img[instruction]`);
+            if (existingImg) {
+                const loadingPlaceholder = createLoadingPlaceholder(tagId);
+                existingImg.replaceWith(loadingPlaceholder);
+                
+                const statusEl = loadingPlaceholder.querySelector('.iig-status');
+                
+                const dataUrl = await generateImageWithRetry(
+                    tag.prompt,
+                    tag.style,
+                    (status) => { statusEl.textContent = status; },
+                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality }
+                );
+                
+                statusEl.textContent = 'Сохранение...';
+                const imagePath = await saveImageToFile(dataUrl);
+                
+                const img = document.createElement('img');
+                img.className = 'iig-generated-image';
+                img.src = imagePath;
+                img.alt = tag.prompt;
+                loadingPlaceholder.replaceWith(img);
+                
+                // Update message.mes
+                const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
+                message.mes = message.mes.replace(tag.fullMatch, updatedTag);
+                
+                toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
+            }
+        } catch (error) {
+            iigLog('ERROR', `Regeneration failed for tag ${index}:`, error.message);
+            toastr.error(`Ошибка: ${error.message}`, 'Генерация картинок');
+        }
+    }
+    
+    processingMessages.delete(messageId);
+    await context.saveChat();
+    iigLog('INFO', `Regeneration complete for message ${messageId}`);
+}
+
+/**
+ * Add regenerate button to message
+ */
+function addRegenerateButton(messageElement, messageId) {
+    // Check if button already exists
+    if (messageElement.querySelector('.iig-regenerate-btn')) return;
+    
+    // Find the message actions area
+    const actionsArea = messageElement.querySelector('.mes_buttons');
+    if (!actionsArea) return;
+    
+    const btn = document.createElement('div');
+    btn.className = 'mes_button iig-regenerate-btn';
+    btn.title = 'Перегенерировать картинки';
+    btn.innerHTML = '<i class="fa-solid fa-images"></i>';
+    btn.addEventListener('click', () => regenerateMessageImages(messageId));
+    
+    actionsArea.appendChild(btn);
+}
+
+/**
  * Handle CHARACTER_MESSAGE_RENDERED event
  * This fires AFTER the message is rendered to DOM
  */
 async function onMessageReceived(messageId) {
-    console.log('[IIG] onMessageReceived called with messageId:', messageId);
+    iigLog('INFO', `onMessageReceived: ${messageId}`);
     
     const settings = getSettings();
     if (!settings.enabled) {
-        console.log('[IIG] Extension disabled, skipping');
+        iigLog('INFO', 'Extension disabled, skipping');
         return;
     }
     
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
-    console.log('[IIG] Message content preview:', message?.mes?.substring(0, 100));
-    console.log('[IIG] Contains IMG:GEN tag:', message?.mes?.includes('[IMG:GEN:'));
+    
+    // Add regenerate button if message has instruction tags
+    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (messageElement && message?.mes?.includes('instruction=')) {
+        addRegenerateButton(messageElement, messageId);
+    }
     
     await processMessageTags(messageId);
 }
