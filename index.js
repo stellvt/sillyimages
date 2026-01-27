@@ -1260,10 +1260,8 @@ async function onMessageReceived(messageId) {
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!messageElement) return;
     
-    // Add regenerate button if message has data-iig-instruction tags
-    if (message?.mes?.includes('data-iig-instruction=')) {
-        addRegenerateButton(messageElement, messageId);
-    }
+    // Always add regenerate button for AI messages
+    addRegenerateButton(messageElement, messageId);
     
     await processMessageTags(messageId);
 }
