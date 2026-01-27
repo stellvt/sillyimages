@@ -811,34 +811,51 @@ function createLoadingPlaceholder(tagId) {
     return placeholder;
 }
 
+// Error placeholder SVG as data URL (red warning icon with text)
+const ERROR_IMAGE_SVG = `data:image/svg+xml,${encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300">
+  <rect fill="#1a1a1a" width="400" height="300" rx="8"/>
+  <circle cx="200" cy="100" r="40" fill="none" stroke="#ff4444" stroke-width="4"/>
+  <text x="200" y="115" text-anchor="middle" fill="#ff4444" font-size="50" font-family="Arial">!</text>
+  <text x="200" y="180" text-anchor="middle" fill="#888" font-size="16" font-family="Arial">Ошибка генерации</text>
+  <text x="200" y="210" text-anchor="middle" fill="#666" font-size="14" font-family="Arial">Нажмите для повтора</text>
+</svg>
+`)}`;
+
 /**
- * Create error placeholder element
+ * Create error placeholder element - preserves img with data-iig-instruction for DOM search
  */
 function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
-    const placeholder = document.createElement('div');
-    placeholder.className = 'iig-error-placeholder';
-    placeholder.dataset.tagId = tagId;
+    // Create a wrapper div
+    const wrapper = document.createElement('div');
+    wrapper.className = 'iig-error-wrapper';
+    wrapper.dataset.tagId = tagId;
+    wrapper.dataset.tagInfo = JSON.stringify(tagInfo);
     
-    // Sanitize error message to prevent XSS
-    const safeErrorMessage = sanitizeForHtml(errorMessage);
+    // Create IMG element with preserved data-iig-instruction for DOM search
+    const img = document.createElement('img');
+    img.className = 'iig-error-image';
+    img.src = ERROR_IMAGE_SVG;
+    img.alt = 'Ошибка генерации';
+    // CRITICAL: Preserve data-iig-instruction so DOM search finds it on retry
+    if (tagInfo.fullMatch) {
+        // Extract instruction JSON from fullMatch
+        const instructionMatch = tagInfo.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
+        if (instructionMatch) {
+            img.setAttribute('data-iig-instruction', instructionMatch[2]);
+        }
+    }
     
-    placeholder.innerHTML = `
-        <div class="iig-error-icon">&#9888;</div>
-        <div class="iig-error-text">${safeErrorMessage}</div>
-        <button class="iig-retry-btn menu_button">
-            <i class="fa-solid fa-rotate-right"></i> Повторить
-        </button>
-    `;
+    wrapper.appendChild(img);
     
-    // Store tag info for retry
-    placeholder.dataset.tagInfo = JSON.stringify(tagInfo);
-    
-    // Add retry handler
-    placeholder.querySelector('.iig-retry-btn').addEventListener('click', () => {
-        retryGeneration(placeholder, tagInfo);
+    // Add click handler for retry on the whole wrapper
+    wrapper.style.cursor = 'pointer';
+    wrapper.title = `Ошибка: ${errorMessage}\nНажмите для повтора`;
+    wrapper.addEventListener('click', () => {
+        retryGeneration(wrapper, tagInfo);
     });
     
-    return placeholder;
+    return wrapper;
 }
 
 /**
@@ -865,12 +882,34 @@ async function retryGeneration(placeholder, tagInfo) {
         statusEl.textContent = 'Сохранение...';
         const imagePath = await saveImageToFile(dataUrl);
         
-        // Replace with image
+        // Replace with image, preserving data-iig-instruction
         const img = document.createElement('img');
         img.className = 'iig-generated-image';
         img.src = imagePath;
         img.alt = tagInfo.prompt;
+        // Preserve data-iig-instruction for potential re-generation
+        if (tagInfo.fullMatch) {
+            const instructionMatch = tagInfo.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
+            if (instructionMatch) {
+                img.setAttribute('data-iig-instruction', instructionMatch[2]);
+            }
+        }
         loadingPlaceholder.replaceWith(img);
+        
+        // Update message.mes with the real path
+        const context = SillyTavern.getContext();
+        const messageElement = loadingPlaceholder.closest('.mes[mesid]');
+        if (messageElement) {
+            const messageId = parseInt(messageElement.getAttribute('mesid'));
+            const message = context.chat[messageId];
+            if (message && tagInfo.fullMatch) {
+                const updatedTag = tagInfo.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
+                // Handle both original tag and error-marked tag
+                message.mes = message.mes.replace(tagInfo.fullMatch, updatedTag);
+                message.mes = message.mes.replace(/src\s*=\s*(['"])\[IMG:ERROR\]\1/gi, `src="${imagePath}"`);
+                await context.saveChat();
+            }
+        }
         
         toastr.success('Картинка сгенерирована!', 'Генерация картинок');
     } catch (error) {
