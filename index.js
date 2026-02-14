@@ -48,7 +48,7 @@ function exportLogs() {
 // Default settings
 const defaultSettings = Object.freeze({
     enabled: true,
-    apiType: 'openai', // 'openai' or 'gemini'
+    apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
     endpoint: '',
     apiKey: '',
     model: '',
@@ -62,6 +62,11 @@ const defaultSettings = Object.freeze({
     userAvatarFile: '', // Selected user avatar filename from /User Avatars/
     aspectRatio: '1:1', // "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
     imageSize: '1K', // "1K", "2K", "4K"
+    // Naistera specific (UI only for now)
+    naisteraAspectRatio: '1:1',
+    naisteraPreset: '', // '', 'digital', 'realism'
+    naisteraSendCharAvatar: false,
+    naisteraSendUserAvatar: false,
 });
 
 // Image model detection keywords (from your api_client.py)
@@ -223,6 +228,26 @@ async function imageUrlToBase64(url) {
 }
 
 /**
+ * Convert image URL to data URL (data:image/...;base64,...)
+ */
+async function imageUrlToDataUrl(url) {
+    try {
+        const response = await fetch(url);
+        const blob = await response.blob();
+
+        return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (error) {
+        console.error('[IIG] Failed to convert image to data URL:', error);
+        return null;
+    }
+}
+
+/**
  * Save base64 image to file via SillyTavern API
  * @param {string} dataUrl - Data URL (data:image/png;base64,...)
  * @returns {Promise<string>} - Relative path to saved file
@@ -306,6 +331,37 @@ async function getCharacterAvatarBase64() {
         return null;
     } catch (error) {
         console.error('[IIG] Error getting character avatar:', error);
+        return null;
+    }
+}
+
+/**
+ * Get character avatar as data URL (for Naistera references)
+ */
+async function getCharacterAvatarDataUrl() {
+    try {
+        const context = SillyTavern.getContext();
+
+        if (context.characterId === undefined || context.characterId === null) {
+            return null;
+        }
+
+        if (typeof context.getCharacterAvatar === 'function') {
+            const avatarUrl = context.getCharacterAvatar(context.characterId);
+            if (avatarUrl) {
+                return await imageUrlToDataUrl(avatarUrl);
+            }
+        }
+
+        const character = context.characters?.[context.characterId];
+        if (character?.avatar) {
+            const avatarUrl = `/characters/${encodeURIComponent(character.avatar)}`;
+            return await imageUrlToDataUrl(avatarUrl);
+        }
+
+        return null;
+    } catch (error) {
+        console.error('[IIG] Error getting character avatar data URL:', error);
         return null;
     }
 }
@@ -508,6 +564,70 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
 }
 
 /**
+ * Get user avatar as data URL (for Naistera references)
+ * Reuses the same selected user avatar file as Gemini settings.
+ */
+async function getUserAvatarDataUrl() {
+    try {
+        const settings = getSettings();
+        if (!settings.userAvatarFile) {
+            return null;
+        }
+        const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
+        return await imageUrlToDataUrl(avatarUrl);
+    } catch (error) {
+        console.error('[IIG] Error getting user avatar data URL:', error);
+        return null;
+    }
+}
+
+/**
+ * Generate image via Naistera custom endpoint
+ * POST {endpoint}/api/generate
+ * Auth: Authorization: Bearer <token>
+ * Response: { data_url, content_type }
+ */
+async function generateImageNaistera(prompt, style, options = {}) {
+    const settings = getSettings();
+    const endpoint = settings.endpoint.replace(/\/$/, '');
+    const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
+
+    const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+
+    const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
+    const preset = options.preset || settings.naisteraPreset || null;
+    const referenceImages = options.referenceImages || [];
+
+    const body = {
+        prompt: fullPrompt,
+        aspect_ratio: aspectRatio,
+    };
+    if (preset) body.preset = preset;
+    if (referenceImages.length > 0) body.reference_images = referenceImages.slice(0, 4);
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${settings.apiKey}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`API Error (${response.status}): ${text}`);
+    }
+
+    const result = await response.json();
+    if (!result?.data_url) {
+        throw new Error('No data_url in response');
+    }
+
+    return result.data_url;
+}
+
+/**
  * Validate settings before generation
  */
 function validateSettings() {
@@ -520,7 +640,7 @@ function validateSettings() {
     if (!settings.apiKey) {
         errors.push('API ключ не настроен');
     }
-    if (!settings.model) {
+    if (settings.apiType !== 'naistera' && !settings.model) {
         errors.push('Модель не выбрана');
     }
     
@@ -553,29 +673,32 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const maxRetries = settings.maxRetries;
     const baseDelay = settings.retryDelay;
     
-    // Collect reference images if enabled (for Gemini/nano-banana)
+    // Collect reference images (provider-specific)
     const referenceImages = [];
-    
+    const referenceDataUrls = [];
+
+    // Gemini/nano-banana references: base64 only
     if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
         if (settings.sendCharAvatar) {
-            console.log('[IIG] Fetching character avatar for reference...');
             const charAvatar = await getCharacterAvatarBase64();
-            if (charAvatar) {
-                referenceImages.push(charAvatar);
-                console.log('[IIG] Character avatar added to references');
-            }
+            if (charAvatar) referenceImages.push(charAvatar);
         }
-        
         if (settings.sendUserAvatar) {
-            console.log('[IIG] Fetching user avatar for reference...');
             const userAvatar = await getUserAvatarBase64();
-            if (userAvatar) {
-                referenceImages.push(userAvatar);
-                console.log('[IIG] User avatar added to references');
-            }
+            if (userAvatar) referenceImages.push(userAvatar);
         }
-        
-        console.log(`[IIG] Total reference images: ${referenceImages.length}`);
+    }
+
+    // Naistera references: data URLs (server uploads to Grok)
+    if (settings.apiType === 'naistera') {
+        if (settings.naisteraSendCharAvatar) {
+            const d = await getCharacterAvatarDataUrl();
+            if (d) referenceDataUrls.push(d);
+        }
+        if (settings.naisteraSendUserAvatar) {
+            const d = await getUserAvatarDataUrl();
+            if (d) referenceDataUrls.push(d);
+        }
     }
     
     let lastError;
@@ -585,7 +708,9 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
             
             // Choose API based on type or model
-            if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+            if (settings.apiType === 'naistera') {
+                return await generateImageNaistera(prompt, style, { ...options, referenceImages: referenceDataUrls });
+            } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
                 return await generateImageGemini(prompt, style, referenceImages, options);
             } else {
                 return await generateImageOpenAI(prompt, style, referenceImages, options);
@@ -782,6 +907,7 @@ async function parseImageTags(text, options = {}) {
                 style: data.style || '',
                 prompt: data.prompt || '',
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
+                preset: data.preset || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
                 isNewFormat: true,
@@ -868,6 +994,7 @@ async function parseImageTags(text, options = {}) {
                 style: data.style || '',
                 prompt: data.prompt || '',
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
+                preset: data.preset || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
                 isNewFormat: false
@@ -1125,7 +1252,7 @@ async function processMessageTags(messageId) {
                 tag.prompt,
                 tag.style,
                 (status) => { statusEl.textContent = status; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset }
             );
             
             // Save image to file instead of keeping base64
@@ -1281,7 +1408,7 @@ async function regenerateMessageImages(messageId) {
                     tag.prompt,
                     tag.style,
                     (status) => { statusEl.textContent = status; },
-                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality }
+                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset }
                 );
                 
                 statusEl.textContent = 'Сохранение...';
@@ -1428,6 +1555,7 @@ function createSettingsUI() {
                         <select id="iig_api_type" class="flex1">
                             <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
                             <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
+                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera/Grok (naistera.org)</option>
                         </select>
                     </div>
                     
@@ -1448,9 +1576,10 @@ function createSettingsUI() {
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
+                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera/Grok: вставьте токен из Telegram бота. Модель не требуется.</p>
                     
                     <!-- Модель -->
-                    <div class="flex-row">
+                    <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
                         <label for="iig_model">Модель</label>
                         <select id="iig_model" class="flex1">
                             ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите модель --</option>'}
@@ -1465,7 +1594,7 @@ function createSettingsUI() {
                     <h4>Параметры генерации</h4>
                     
                     <!-- Размер -->
-                    <div class="flex-row">
+                    <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
                         <label for="iig_size">Размер</label>
                         <select id="iig_size" class="flex1">
                             <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
@@ -1476,12 +1605,58 @@ function createSettingsUI() {
                     </div>
                     
                     <!-- Качество -->
-                    <div class="flex-row">
+                    <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
                         <label for="iig_quality">Качество</label>
                         <select id="iig_quality" class="flex1">
                             <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
                             <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
                         </select>
+                    </div>
+
+                    <!-- Naistera params -->
+                    <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
+                        <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
+                        <select id="iig_naistera_aspect_ratio" class="flex1">
+                            <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
+                            <option value="16:9" ${settings.naisteraAspectRatio === '16:9' ? 'selected' : ''}>16:9</option>
+                            <option value="9:16" ${settings.naisteraAspectRatio === '9:16' ? 'selected' : ''}>9:16</option>
+                            <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
+                            <option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
+                        </select>
+                    </div>
+                    <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_preset_row">
+                        <label for="iig_naistera_preset">Пресеты</label>
+                        <select id="iig_naistera_preset" class="flex1">
+                            <option value="" ${!settings.naisteraPreset ? 'selected' : ''}>без пресета</option>
+                            <option value="digital" ${settings.naisteraPreset === 'digital' ? 'selected' : ''}>digital</option>
+                            <option value="realism" ${settings.naisteraPreset === 'realism' ? 'selected' : ''}>realism</option>
+                        </select>
+                    </div>
+
+                    <!-- Naistera references (UI only for now) -->
+                    <div class="iig-naistera-refs ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
+                        <h4>Референсы</h4>
+                        <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="iig_naistera_send_char_avatar" ${settings.naisteraSendCharAvatar ? 'checked' : ''}>
+                            <span>Отправлять аватар {{char}}</span>
+                        </label>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
+                            <span>Отправлять аватар {{user}}</span>
+                        </label>
+
+                        <!-- User Avatar Selection (reuses common userAvatarFile setting) -->
+                        <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}" style="margin-top: 5px;">
+                            <label for="iig_naistera_user_avatar_file">Аватар {{user}}</label>
+                            <select id="iig_naistera_user_avatar_file" class="flex1">
+                                <option value="">-- Не выбран --</option>
+                                ${settings.userAvatarFile ? `<option value="${settings.userAvatarFile}" selected>${settings.userAvatarFile}</option>` : ''}
+                            </select>
+                            <div id="iig_naistera_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
+                                <i class="fa-solid fa-sync"></i>
+                            </div>
+                        </div>
                     </div>
                     
                     <hr>
@@ -1589,6 +1764,34 @@ function createSettingsUI() {
  */
 function bindSettingsEvents() {
     const settings = getSettings();
+
+    const updateVisibility = () => {
+        const apiType = settings.apiType;
+        const isNaistera = apiType === 'naistera';
+        const isGemini = apiType === 'gemini';
+        const isOpenAI = apiType === 'openai';
+
+        // Model is used for OpenAI and Gemini; Naistera does not need a model.
+        document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
+
+        // OpenAI-only params
+        document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
+        document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
+
+        // Naistera-only params
+        document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
+        document.getElementById('iig_naistera_preset_row')?.classList.toggle('iig-hidden', !isNaistera);
+        document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
+        document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
+
+        document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
+
+        // Avatar section is only for Gemini/nano-banana
+        const avatarSection = document.getElementById('iig_avatar_section');
+        if (avatarSection) {
+            avatarSection.classList.toggle('hidden', !isGemini);
+        }
+    };
     
     // Enable toggle
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => {
@@ -1600,12 +1803,7 @@ function bindSettingsEvents() {
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value;
         saveSettings();
-        
-        // Show/hide avatar section
-        const avatarSection = document.getElementById('iig_avatar_section');
-        if (avatarSection) {
-            avatarSection.classList.toggle('hidden', e.target.value !== 'gemini');
-        }
+        updateVisibility();
     });
     
     // Endpoint
@@ -1642,7 +1840,7 @@ function bindSettingsEvents() {
         if (isGeminiModel(e.target.value)) {
             document.getElementById('iig_api_type').value = 'gemini';
             settings.apiType = 'gemini';
-            document.getElementById('iig_avatar_section')?.classList.remove('hidden');
+            updateVisibility();
         }
     });
     
@@ -1698,6 +1896,63 @@ function bindSettingsEvents() {
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
         settings.imageSize = e.target.value;
         saveSettings();
+    });
+
+    // Naistera aspect ratio
+    document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => {
+        settings.naisteraAspectRatio = e.target.value;
+        saveSettings();
+    });
+
+    // Naistera preset
+    document.getElementById('iig_naistera_preset')?.addEventListener('change', (e) => {
+        settings.naisteraPreset = e.target.value;
+        saveSettings();
+    });
+
+    // Naistera references (UI only for now)
+    document.getElementById('iig_naistera_send_char_avatar')?.addEventListener('change', (e) => {
+        settings.naisteraSendCharAvatar = e.target.checked;
+        saveSettings();
+    });
+    document.getElementById('iig_naistera_send_user_avatar')?.addEventListener('change', (e) => {
+        settings.naisteraSendUserAvatar = e.target.checked;
+        saveSettings();
+        updateVisibility();
+    });
+
+    // Naistera user avatar file selection (reuses settings.userAvatarFile)
+    document.getElementById('iig_naistera_user_avatar_file')?.addEventListener('change', (e) => {
+        settings.userAvatarFile = e.target.value;
+        saveSettings();
+    });
+
+    // Naistera refresh user avatars list
+    document.getElementById('iig_naistera_refresh_avatars')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        btn.classList.add('loading');
+
+        try {
+            const avatars = await fetchUserAvatars();
+            const select = document.getElementById('iig_naistera_user_avatar_file');
+            const currentAvatar = settings.userAvatarFile;
+
+            select.innerHTML = '<option value="">-- Не выбран --</option>';
+
+            for (const avatar of avatars) {
+                const option = document.createElement('option');
+                option.value = avatar;
+                option.textContent = avatar;
+                option.selected = avatar === currentAvatar;
+                select.appendChild(option);
+            }
+
+            toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
+        } catch (error) {
+            toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
+        } finally {
+            btn.classList.remove('loading');
+        }
     });
     
     // Send char avatar
@@ -1768,6 +2023,9 @@ function bindSettingsEvents() {
     document.getElementById('iig_export_logs')?.addEventListener('click', () => {
         exportLogs();
     });
+
+    // Apply initial state
+    updateVisibility();
 }
 
 /**
