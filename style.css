@@ -4,38 +4,68 @@
 .iig-settings {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
+    /* SillyTavern can apply pre-wrap in some panels; avoid showing template indentation. */
+    white-space: normal !important;
+}
+
+.iig-settings * {
+    white-space: normal !important;
 }
 
 .iig-settings .flex-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(140px, 180px) 1fr auto;
     align-items: center;
-    gap: 10px;
+    column-gap: 10px;
+    row-gap: 6px;
 }
 
 .iig-settings .flex-row > label {
-    min-width: 120px;
+    min-width: 0;
 }
 
 .iig-settings .flex1 {
     flex: 1;
+    min-width: 0;
 }
 
 .iig-settings hr {
-    margin: 10px 0;
+    margin: 8px 0;
     border: none;
     border-top: 1px solid var(--SmartThemeBorderColor);
 }
 
 .iig-settings h4 {
-    margin: 5px 0;
+    margin: 6px 0 2px;
     color: var(--SmartThemeBodyColor);
 }
 
 .iig-settings .hint {
     font-size: 0.85em;
     color: var(--SmartThemeQuoteColor);
-    margin-top: 2px;
+    margin: 0;
+}
+
+.iig-hidden {
+    display: none !important;
+}
+
+.iig-naistera-refs {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    background: var(--SmartThemeBlurTintColor);
+    border-radius: 6px;
+}
+
+.iig-naistera-refs h4 {
+    margin: 0;
+}
+
+.iig-naistera-refs .hint {
+    margin-bottom: 4px;
 }
 
 /* Avatar options section - shown only for nano-banana */
