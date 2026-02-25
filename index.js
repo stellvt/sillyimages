@@ -252,17 +252,114 @@ async function imageUrlToDataUrl(url) {
  * @param {string} dataUrl - Data URL (data:image/png;base64,...)
  * @returns {Promise<string>} - Relative path to saved file
  */
-async function saveImageToFile(dataUrl) {
-    const context = SillyTavern.getContext();
-    
-    // Extract base64 and format from data URL
-    const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
-    if (!match) {
-        throw new Error('Invalid data URL format');
+const IIG_UPLOAD_FORMAT_MAP = Object.freeze({
+    'jpeg': 'jpg',
+    'jpg': 'jpg',
+    'pjpeg': 'jpg',
+    'jfif': 'jpg',
+    'png': 'png',
+    'x-png': 'png',
+    'webp': 'webp',
+    'gif': 'gif',
+});
+
+const IIG_UPLOAD_ALLOWED_FORMATS = new Set(['jpg', 'png', 'webp', 'gif']);
+
+function parseImageDataUrl(dataUrl) {
+    if (typeof dataUrl !== 'string') {
+        throw new Error(`Invalid data URL type: ${typeof dataUrl}`);
     }
-    
-    const format = match[1]; // png, jpeg, webp
-    const base64Data = match[2];
+    if (!dataUrl.startsWith('data:')) {
+        throw new Error('Invalid data URL prefix (expected data:)');
+    }
+
+    const commaIdx = dataUrl.indexOf(',');
+    if (commaIdx <= 5) {
+        throw new Error('Invalid data URL format (missing comma)');
+    }
+
+    const meta = dataUrl.slice(5, commaIdx).trim();
+    const base64Data = dataUrl.slice(commaIdx + 1).trim();
+    const metaParts = meta.split(';').map(s => s.trim()).filter(Boolean);
+    const mimeType = (metaParts[0] || '').toLowerCase();
+    const hasBase64 = metaParts.some(p => p.toLowerCase() === 'base64');
+
+    if (!mimeType.startsWith('image/')) {
+        throw new Error(`Invalid data URL mime type: ${mimeType || '(empty)'}`);
+    }
+    if (!hasBase64) {
+        throw new Error('Invalid data URL encoding (base64 flag missing)');
+    }
+    if (!base64Data) {
+        throw new Error('Invalid data URL payload (empty base64)');
+    }
+
+    const subtype = mimeType.slice('image/'.length).toLowerCase();
+    const normalizedFormat = IIG_UPLOAD_FORMAT_MAP[subtype] || subtype;
+
+    return {
+        mimeType,
+        subtype,
+        normalizedFormat,
+        base64Data,
+    };
+}
+
+async function convertDataUrlToPng(dataUrl) {
+    return await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const width = img.naturalWidth || img.width;
+            const height = img.naturalHeight || img.height;
+            if (!width || !height) {
+                reject(new Error('Image decode failed (no dimensions)'));
+                return;
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                reject(new Error('Canvas 2D context unavailable'));
+                return;
+            }
+            ctx.drawImage(img, 0, 0);
+            resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = () => reject(new Error('Failed to decode data URL image'));
+        img.src = dataUrl;
+    });
+}
+
+async function saveImageToFile(dataUrl, debugMeta = {}) {
+    const context = SillyTavern.getContext();
+
+    let parsed;
+    try {
+        parsed = parseImageDataUrl(dataUrl);
+    } catch (error) {
+        iigLog(
+            'ERROR',
+            `saveImageToFile parse failed: ${error.message}; debug=${JSON.stringify(debugMeta)}; prefix=${String(dataUrl).slice(0, 120)}`
+        );
+        throw error;
+    }
+
+    if (!IIG_UPLOAD_ALLOWED_FORMATS.has(parsed.normalizedFormat)) {
+        iigLog(
+            'WARN',
+            `Unsupported upload format "${parsed.subtype}" (mime=${parsed.mimeType}); converting to PNG; debug=${JSON.stringify(debugMeta)}`
+        );
+        const converted = await convertDataUrlToPng(dataUrl);
+        parsed = parseImageDataUrl(converted);
+    }
+
+    const format = parsed.normalizedFormat;
+    const base64Data = parsed.base64Data;
+    iigLog(
+        'INFO',
+        `Uploading image: mime=${parsed.mimeType} subtype=${parsed.subtype} format=${format} b64len=${base64Data.length} debug=${JSON.stringify(debugMeta)}`
+    );
     
     // Get character name for subfolder
     let charName = 'generated';
@@ -286,8 +383,19 @@ async function saveImageToFile(dataUrl) {
     });
     
     if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(error.error || `Upload failed: ${response.status}`);
+        const raw = await response.text().catch(() => '');
+        let parsedError = {};
+        try {
+            parsedError = raw ? JSON.parse(raw) : {};
+        } catch (_e) {
+            parsedError = {};
+        }
+        const errText = parsedError?.error || parsedError?.detail || raw || `Upload failed: ${response.status}`;
+        iigLog(
+            'ERROR',
+            `Upload failed status=${response.status} format=${format} mime=${parsed.mimeType} debug=${JSON.stringify(debugMeta)} response=${String(errText).slice(0, 400)}`
+        );
+        throw new Error(errText);
     }
     
     const result = await response.json();
@@ -706,15 +814,36 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
-            
+            let generated;
             // Choose API based on type or model
             if (settings.apiType === 'naistera') {
-                return await generateImageNaistera(prompt, style, { ...options, referenceImages: referenceDataUrls });
+                generated = await generateImageNaistera(prompt, style, { ...options, referenceImages: referenceDataUrls });
             } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
-                return await generateImageGemini(prompt, style, referenceImages, options);
+                generated = await generateImageGemini(prompt, style, referenceImages, options);
             } else {
-                return await generateImageOpenAI(prompt, style, referenceImages, options);
+                generated = await generateImageOpenAI(prompt, style, referenceImages, options);
             }
+
+            if (typeof generated === 'string' && generated.startsWith('data:')) {
+                try {
+                    const parsed = parseImageDataUrl(generated);
+                    iigLog(
+                        'INFO',
+                        `Generation result: apiType=${settings.apiType} mime=${parsed.mimeType} subtype=${parsed.subtype} b64len=${parsed.base64Data.length}`
+                    );
+                } catch (parseErr) {
+                    iigLog(
+                        'WARN',
+                        `Generation result has unparsable data URL: ${parseErr.message}; prefix=${generated.slice(0, 120)}`
+                    );
+                }
+            } else {
+                iigLog(
+                    'INFO',
+                    `Generation result is non-data-url: apiType=${settings.apiType} value=${String(generated).slice(0, 160)}`
+                );
+            }
+            return generated;
         } catch (error) {
             lastError = error;
             console.error(`[IIG] Generation attempt ${attempt + 1} failed:`, error);
@@ -1257,7 +1386,12 @@ async function processMessageTags(messageId) {
             
             // Save image to file instead of keeping base64
             statusEl.textContent = 'Сохранение...';
-            const imagePath = await saveImageToFile(dataUrl);
+            const imagePath = await saveImageToFile(dataUrl, {
+                messageId,
+                tagIndex: index,
+                mode: 'generate',
+                apiType: getSettings().apiType,
+            });
             
             // Replace placeholder with actual image
             const img = document.createElement('img');
@@ -1412,7 +1546,12 @@ async function regenerateMessageImages(messageId) {
                 );
                 
                 statusEl.textContent = 'Сохранение...';
-                const imagePath = await saveImageToFile(dataUrl);
+                const imagePath = await saveImageToFile(dataUrl, {
+                    messageId,
+                    tagIndex: index,
+                    mode: 'regenerate',
+                    apiType: getSettings().apiType,
+                });
                 
                 const img = document.createElement('img');
                 img.className = 'iig-generated-image';
