@@ -64,6 +64,7 @@ const defaultSettings = Object.freeze({
     imageSize: '1K', // "1K", "2K", "4K"
     // Naistera specific (UI only for now)
     naisteraAspectRatio: '1:1',
+    naisteraModel: 'grok', // 'grok' | 'nano banana' | 'nano banana pro' | 'nano banana 2'
     naisteraPreset: '', // '', 'digital', 'realism'
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
@@ -114,6 +115,18 @@ function isImageModel(modelId) {
 function isGeminiModel(modelId) {
     const mid = modelId.toLowerCase();
     return mid.includes('nano-banana');
+}
+
+const NAISTERA_MODELS = Object.freeze(['grok', 'nano banana', 'nano banana pro', 'nano banana 2']);
+
+function normalizeNaisteraModel(model) {
+    const raw = String(model || '').trim().toLowerCase();
+    if (!raw) return 'grok';
+    if (raw === 'nano-banana') return 'nano banana';
+    if (raw === 'nano-banana-pro') return 'nano banana pro';
+    if (raw === 'nano-banana-2') return 'nano banana 2';
+    if (NAISTERA_MODELS.includes(raw)) return raw;
+    return 'grok';
 }
 
 /**
@@ -703,12 +716,14 @@ async function generateImageNaistera(prompt, style, options = {}) {
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
 
     const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
+    const model = normalizeNaisteraModel(options.model || settings.naisteraModel || 'grok');
     const preset = options.preset || settings.naisteraPreset || null;
     const referenceImages = options.referenceImages || [];
 
     const body = {
         prompt: fullPrompt,
         aspect_ratio: aspectRatio,
+        model,
     };
     if (preset) body.preset = preset;
     if (referenceImages.length > 0) body.reference_images = referenceImages.slice(0, 4);
@@ -750,6 +765,12 @@ function validateSettings() {
     }
     if (settings.apiType !== 'naistera' && !settings.model) {
         errors.push('Модель не выбрана');
+    }
+    if (settings.apiType === 'naistera') {
+        const m = normalizeNaisteraModel(settings.naisteraModel);
+        if (!NAISTERA_MODELS.includes(m)) {
+            errors.push('Для Naistera выберите модель: grok / nano banana / nano banana pro / nano banana 2');
+        }
     }
     
     if (errors.length > 0) {
@@ -1715,7 +1736,7 @@ function createSettingsUI() {
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
-                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera/Grok: вставьте токен из Telegram бота. Модель не требуется.</p>
+                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / nano banana / nano banana pro / nano banana 2).</p>
                     
                     <!-- Модель -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
@@ -1753,6 +1774,15 @@ function createSettingsUI() {
                     </div>
 
                     <!-- Naistera params -->
+                    <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_model_row">
+                        <label for="iig_naistera_model">Модель</label>
+                        <select id="iig_naistera_model" class="flex1">
+                            <option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>grok</option>
+                            <option value="nano banana" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana' ? 'selected' : ''}>nano banana</option>
+                            <option value="nano banana pro" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana pro' ? 'selected' : ''}>nano banana pro</option>
+                            <option value="nano banana 2" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana 2' ? 'selected' : ''}>nano banana 2</option>
+                        </select>
+                    </div>
                     <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
                         <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
                         <select id="iig_naistera_aspect_ratio" class="flex1">
@@ -1918,6 +1948,7 @@ function bindSettingsEvents() {
         document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
 
         // Naistera-only params
+        document.getElementById('iig_naistera_model_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_preset_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
@@ -2034,6 +2065,12 @@ function bindSettingsEvents() {
     // Image Size (nano-banana)
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => {
         settings.imageSize = e.target.value;
+        saveSettings();
+    });
+
+    // Naistera aspect ratio
+    document.getElementById('iig_naistera_model')?.addEventListener('change', (e) => {
+        settings.naisteraModel = normalizeNaisteraModel(e.target.value);
         saveSettings();
     });
 

@@ -70,12 +70,12 @@ LLM видит тот же формат, но понимает: есть реа�
 **Gemini-совместимый** — `/v1beta/models/{model}:generateContent`
 - Nano Banana/Nano Banana Pro через Google/прокси
 
-**Naistera/Grok** — `/api/generate`
+**Naistera/Grok/Nano Banana** — `/api/generate`
 - Авторизация: `Authorization: Bearer <token>`
 - URL эндпоинта в настройках: `https://naistera.org/api/generate` (или `https://naistera.org` — расширение добавит `/api/generate`)
-- Тело: `{ "prompt": "...", "aspect_ratio": "3:2", "preset": "digital", "parent_post_id": "<grok-post-id>" }`
+- Тело: `{ "prompt": "...", "model": "grok|nano banana|nano banana pro|nano banana 2", "aspect_ratio": "3:2", "preset": "digital" }`
 - Ответ: `{ "data_url": "data:image/png;base64,...", "content_type": "image/png" }`
-- В настройках Naistera/Grok доступны параметры: `aspect_ratio` и `preset` (по умолчанию).
+- В настройках Naistera доступны параметры: `model`, `aspect_ratio` и `preset` (по умолчанию).
 
 ## Как работает
 
