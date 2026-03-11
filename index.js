@@ -125,6 +125,14 @@ function isGeminiModel(modelId) {
 }
 
 const NAISTERA_MODELS = Object.freeze(['grok', 'nano banana']);
+const DEFAULT_ENDPOINTS = Object.freeze({
+    naistera: 'https://naistera.org',
+});
+const ENDPOINT_PLACEHOLDERS = Object.freeze({
+    openai: 'https://api.openai.com',
+    gemini: 'https://generativelanguage.googleapis.com',
+    naistera: 'https://naistera.org',
+});
 
 function normalizeNaisteraModel(model) {
     const raw = String(model || '').trim().toLowerCase();
@@ -176,6 +184,34 @@ function shouldTriggerNaisteraVideoForMessage(messageId, everyN) {
     if (normalizedEveryN <= 1) return true;
     const ordinal = getAssistantMessageOrdinal(messageId);
     return ordinal % normalizedEveryN === 0;
+}
+
+function getEndpointPlaceholder(apiType) {
+    return ENDPOINT_PLACEHOLDERS[apiType] || 'https://api.example.com';
+}
+
+function normalizeConfiguredEndpoint(apiType, endpoint) {
+    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!trimmed) {
+        return apiType === 'naistera' ? DEFAULT_ENDPOINTS.naistera : '';
+    }
+    if (apiType === 'naistera') {
+        return trimmed.replace(/\/api\/generate$/i, '');
+    }
+    return trimmed;
+}
+
+function shouldReplaceEndpointForApiType(apiType, endpoint) {
+    const trimmed = String(endpoint || '').trim();
+    if (!trimmed) return true;
+    if (apiType !== 'naistera') return false;
+    return /\/v1\/images\/generations\/?$/i.test(trimmed)
+        || /\/v1\/models\/?$/i.test(trimmed)
+        || /\/v1beta\/models\//i.test(trimmed);
+}
+
+function getEffectiveEndpoint(settings = getSettings()) {
+    return normalizeConfiguredEndpoint(settings.apiType, settings.endpoint);
 }
 
 function buildNaisteraVideoTestPrompt(prompt, style = '') {
@@ -363,13 +399,14 @@ async function collectPreviousContextReferences(messageId, format, requestedCoun
  */
 async function fetchModels() {
     const settings = getSettings();
+    const endpoint = getEffectiveEndpoint(settings);
     
-    if (!settings.endpoint || !settings.apiKey) {
+    if (!endpoint || !settings.apiKey) {
         console.warn('[IIG] Cannot fetch models: endpoint or API key not set');
         return [];
     }
     
-    const url = `${settings.endpoint.replace(/\/$/, '')}/v1/models`;
+    const url = `${endpoint}/v1/models`;
     
     try {
         const response = await fetch(url, {
@@ -987,7 +1024,7 @@ async function getUserAvatarDataUrl() {
  */
 async function generateImageNaistera(prompt, style, options = {}) {
     const settings = getSettings();
-    const endpoint = settings.endpoint.replace(/\/$/, '');
+    const endpoint = getEffectiveEndpoint(settings);
     const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
 
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
@@ -1051,7 +1088,9 @@ function validateSettings() {
     const errors = [];
     
     if (!settings.endpoint) {
-        errors.push('URL эндпоинта не настроен');
+        if (settings.apiType !== 'naistera') {
+            errors.push('URL эндпоинта не настроен');
+        }
     }
     if (!settings.apiKey) {
         errors.push('API ключ не настроен');
@@ -2413,6 +2452,11 @@ function bindSettingsEvents() {
 
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
 
+        const endpointInput = document.getElementById('iig_endpoint');
+        if (endpointInput) {
+            endpointInput.placeholder = getEndpointPlaceholder(apiType);
+        }
+
         // Avatar section is only for Gemini/nano-banana
         const avatarSection = document.getElementById('iig_avatar_section');
         if (avatarSection) {
@@ -2450,7 +2494,20 @@ function bindSettingsEvents() {
     
     // API Type
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
-        settings.apiType = e.target.value;
+        const nextApiType = e.target.value;
+        const endpointInput = document.getElementById('iig_endpoint');
+        if (shouldReplaceEndpointForApiType(nextApiType, settings.endpoint)) {
+            settings.endpoint = normalizeConfiguredEndpoint(nextApiType, '');
+            if (endpointInput) {
+                endpointInput.value = settings.endpoint;
+            }
+        } else if (nextApiType === 'naistera') {
+            settings.endpoint = normalizeConfiguredEndpoint(nextApiType, settings.endpoint);
+            if (endpointInput) {
+                endpointInput.value = settings.endpoint;
+            }
+        }
+        settings.apiType = nextApiType;
         saveSettings();
         updateVisibility();
     });
