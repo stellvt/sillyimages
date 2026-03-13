@@ -48,6 +48,9 @@ function exportLogs() {
 // Default settings
 const defaultSettings = Object.freeze({
     enabled: true,
+    externalBlocks: false,
+    imageContextEnabled: false,
+    imageContextCount: 1,
     apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
     endpoint: '',
     apiKey: '',
@@ -62,12 +65,17 @@ const defaultSettings = Object.freeze({
     userAvatarFile: '', // Selected user avatar filename from /User Avatars/
     aspectRatio: '1:1', // "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
     imageSize: '1K', // "1K", "2K", "4K"
-    // Naistera specific (UI only for now)
+    // Naistera specific
     naisteraAspectRatio: '1:1',
-    naisteraPreset: '', // '', 'digital', 'realism'
+    naisteraModel: 'grok', // 'grok' | 'nano banana'
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
+    naisteraVideoTest: false,
+    naisteraVideoEveryN: 1,
 });
+
+const MAX_CONTEXT_IMAGES = 3;
+const MAX_GENERATION_REFERENCE_IMAGES = 5;
 
 // Image model detection keywords (from your api_client.py)
 const IMAGE_MODEL_KEYWORDS = [
@@ -116,6 +124,97 @@ function isGeminiModel(modelId) {
     return mid.includes('nano-banana');
 }
 
+const NAISTERA_MODELS = Object.freeze(['grok', 'nano banana']);
+const DEFAULT_ENDPOINTS = Object.freeze({
+    naistera: 'https://naistera.org',
+});
+const ENDPOINT_PLACEHOLDERS = Object.freeze({
+    openai: 'https://api.openai.com',
+    gemini: 'https://generativelanguage.googleapis.com',
+    naistera: 'https://naistera.org',
+});
+
+function normalizeNaisteraModel(model) {
+    const raw = String(model || '').trim().toLowerCase();
+    if (!raw) return 'grok';
+    if (raw === 'nano-banana') return 'nano banana';
+    if (raw === 'nano-banana-pro') return 'nano banana';
+    if (raw === 'nano-banana-2') return 'nano banana';
+    if (raw === 'nano banana pro') return 'nano banana';
+    if (raw === 'nano banana 2') return 'nano banana';
+    if (NAISTERA_MODELS.includes(raw)) return raw;
+    return 'grok';
+}
+
+function shouldUseNaisteraVideoTest(model) {
+    const normalized = normalizeNaisteraModel(model);
+    return normalized === 'grok' || normalized === 'nano banana';
+}
+
+function normalizeNaisteraVideoFrequency(value) {
+    const numeric = Number.parseInt(String(value ?? '').trim(), 10);
+    if (!Number.isFinite(numeric) || numeric < 1) return 1;
+    return Math.min(numeric, 999);
+}
+
+function normalizeImageContextCount(value) {
+    const numeric = Number.parseInt(String(value ?? '').trim(), 10);
+    if (!Number.isFinite(numeric) || numeric < 1) return 1;
+    return Math.min(numeric, MAX_CONTEXT_IMAGES);
+}
+
+function getAssistantMessageOrdinal(messageId) {
+    const context = SillyTavern.getContext();
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    let ordinal = 0;
+    for (let i = 0; i < chat.length; i++) {
+        const message = chat[i];
+        if (!message || message.is_user || message.is_system) {
+            continue;
+        }
+        ordinal += 1;
+        if (i === messageId) {
+            return ordinal;
+        }
+    }
+    return Math.max(1, messageId + 1);
+}
+
+function shouldTriggerNaisteraVideoForMessage(messageId, everyN) {
+    const normalizedEveryN = normalizeNaisteraVideoFrequency(everyN);
+    if (normalizedEveryN <= 1) return true;
+    const ordinal = getAssistantMessageOrdinal(messageId);
+    return ordinal % normalizedEveryN === 0;
+}
+
+function getEndpointPlaceholder(apiType) {
+    return ENDPOINT_PLACEHOLDERS[apiType] || 'https://api.example.com';
+}
+
+function normalizeConfiguredEndpoint(apiType, endpoint) {
+    const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!trimmed) {
+        return apiType === 'naistera' ? DEFAULT_ENDPOINTS.naistera : '';
+    }
+    if (apiType === 'naistera') {
+        return trimmed.replace(/\/api\/generate$/i, '');
+    }
+    return trimmed;
+}
+
+function shouldReplaceEndpointForApiType(apiType, endpoint) {
+    const trimmed = String(endpoint || '').trim();
+    if (!trimmed) return true;
+    if (apiType !== 'naistera') return false;
+    return /\/v1\/images\/generations\/?$/i.test(trimmed)
+        || /\/v1\/models\/?$/i.test(trimmed)
+        || /\/v1beta\/models\//i.test(trimmed);
+}
+
+function getEffectiveEndpoint(settings = getSettings()) {
+    return normalizeConfiguredEndpoint(settings.apiType, settings.endpoint);
+}
+
 /**
  * Get extension settings
  */
@@ -144,18 +243,154 @@ function saveSettings() {
     context.saveSettingsDebounced();
 }
 
+function getMessageRenderText(message, settings = getSettings()) {
+    if (!message) return '';
+    if (settings.externalBlocks && message.extra?.display_text) {
+        return message.extra.display_text;
+    }
+    return message.mes || '';
+}
+
+async function parseMessageImageTags(message, options = {}) {
+    const settings = getSettings();
+    const tags = [];
+
+    const mainTags = await parseImageTags(message?.mes || '', options);
+    tags.push(...mainTags.map(tag => ({ ...tag, sourceKey: 'mes' })));
+
+    if (settings.externalBlocks && message?.extra?.extblocks) {
+        const extTags = await parseImageTags(message.extra.extblocks, options);
+        tags.push(...extTags.map(tag => ({ ...tag, sourceKey: 'extblocks' })));
+    }
+
+    return tags;
+}
+
+function replaceTagInMessageSource(message, tag, replacement) {
+    if (!message || !tag) return;
+
+    if (tag.sourceKey === 'extblocks') {
+        if (!message.extra) message.extra = {};
+        message.extra.extblocks = (message.extra.extblocks || '').replace(tag.fullMatch, replacement);
+
+        const swipeId = message.swipe_id;
+        if (swipeId !== undefined && message.swipe_info?.[swipeId]?.extra?.extblocks) {
+            message.swipe_info[swipeId].extra.extblocks =
+                message.swipe_info[swipeId].extra.extblocks.replace(tag.fullMatch, replacement);
+        }
+
+        if (message.extra.display_text) {
+            message.extra.display_text = message.extra.display_text.replace(tag.fullMatch, replacement);
+        }
+        return;
+    }
+
+    message.mes = (message.mes || '').replace(tag.fullMatch, replacement);
+    if (message.extra?.display_text) {
+        message.extra.display_text = message.extra.display_text.replace(tag.fullMatch, replacement);
+    }
+}
+
+function extractGeneratedImageUrlsFromText(text) {
+    const urls = [];
+    const seen = new Set();
+    const rawText = String(text || '');
+
+    const legacyMatches = Array.from(rawText.matchAll(/\[IMG:✓:([^\]]+)\]/g));
+    for (let i = legacyMatches.length - 1; i >= 0; i--) {
+        const src = String(legacyMatches[i][1] || '').trim();
+        if (!src || seen.has(src)) continue;
+        seen.add(src);
+        urls.push(src);
+    }
+
+    if (!rawText.includes('<img')) {
+        return urls;
+    }
+
+    const template = document.createElement('template');
+    template.innerHTML = rawText;
+    const imageNodes = Array.from(
+        template.content.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
+    ).reverse();
+    for (const node of imageNodes) {
+        const src = String(node.getAttribute('src') || '').trim();
+        if (
+            !src ||
+            src.startsWith('data:') ||
+            src.includes('[IMG:') ||
+            src.includes('[VID:') ||
+            src.endsWith('/error.svg') ||
+            seen.has(src)
+        ) {
+            continue;
+        }
+        seen.add(src);
+        urls.push(src);
+    }
+
+    return urls;
+}
+
+function getPreviousGeneratedImageUrls(messageId, requestedCount) {
+    const count = normalizeImageContextCount(requestedCount);
+    if (!Number.isInteger(messageId) || messageId <= 0) {
+        return [];
+    }
+
+    const settings = getSettings();
+    const context = SillyTavern.getContext();
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    const urls = [];
+    const seen = new Set();
+
+    for (let idx = messageId - 1; idx >= 0 && urls.length < count; idx--) {
+        const message = chat[idx];
+        if (!message || message.is_user || message.is_system) {
+            continue;
+        }
+
+        const text = getMessageRenderText(message, settings);
+        const messageUrls = extractGeneratedImageUrlsFromText(text);
+        for (const url of messageUrls) {
+            if (seen.has(url)) {
+                continue;
+            }
+            seen.add(url);
+            urls.push(url);
+            if (urls.length >= count) {
+                break;
+            }
+        }
+    }
+
+    return urls;
+}
+
+async function collectPreviousContextReferences(messageId, format, requestedCount) {
+    const urls = getPreviousGeneratedImageUrls(messageId, requestedCount);
+    if (urls.length === 0) {
+        return [];
+    }
+
+    const convert = format === 'dataUrl' ? imageUrlToDataUrl : imageUrlToBase64;
+    const converted = await Promise.all(urls.map((url) => convert(url)));
+    return converted.filter(Boolean);
+}
+
 /**
  * Fetch models list from endpoint
  */
 async function fetchModels() {
     const settings = getSettings();
+    const endpoint = getEffectiveEndpoint(settings);
     
-    if (!settings.endpoint || !settings.apiKey) {
+    if (!endpoint || !settings.apiKey) {
         console.warn('[IIG] Cannot fetch models: endpoint or API key not set');
         return [];
     }
     
-    const url = `${settings.endpoint.replace(/\/$/, '')}/v1/models`;
+    const url = `${endpoint}/v1/models`;
     
     try {
         const response = await fetch(url, {
@@ -208,8 +443,10 @@ async function fetchUserAvatars() {
  */
 async function imageUrlToBase64(url) {
     try {
-        const response = await fetch(url);
-        const blob = await response.blob();
+        const blob = await fetchImageBlob(url);
+        if (!blob) {
+            return null;
+        }
         
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -232,8 +469,10 @@ async function imageUrlToBase64(url) {
  */
 async function imageUrlToDataUrl(url) {
     try {
-        const response = await fetch(url);
-        const blob = await response.blob();
+        const blob = await fetchImageBlob(url);
+        if (!blob) {
+            return null;
+        }
 
         return await new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -247,22 +486,152 @@ async function imageUrlToDataUrl(url) {
     }
 }
 
+async function fetchImageBlob(url) {
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            iigLog('WARN', `Skipping context reference fetch: url=${url} status=${response.status}`);
+            return null;
+        }
+
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.startsWith('image/')) {
+            iigLog(
+                'WARN',
+                `Skipping context reference with non-image content-type: url=${url} contentType=${contentType || '(empty)'}`
+            );
+            return null;
+        }
+
+        const blob = await response.blob();
+        const blobType = String(blob.type || contentType || '').toLowerCase();
+        if (!blobType.startsWith('image/')) {
+            iigLog(
+                'WARN',
+                `Skipping context reference with non-image blob type: url=${url} blobType=${blobType || '(empty)'}`
+            );
+            return null;
+        }
+        return blob;
+    } catch (error) {
+        iigLog('WARN', `Skipping context reference fetch failure: url=${url} err=${error?.message || error}`);
+        return null;
+    }
+}
+
 /**
  * Save base64 image to file via SillyTavern API
  * @param {string} dataUrl - Data URL (data:image/png;base64,...)
  * @returns {Promise<string>} - Relative path to saved file
  */
-async function saveImageToFile(dataUrl) {
-    const context = SillyTavern.getContext();
-    
-    // Extract base64 and format from data URL
-    const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
-    if (!match) {
-        throw new Error('Invalid data URL format');
+const IIG_UPLOAD_FORMAT_MAP = Object.freeze({
+    'jpeg': 'jpg',
+    'jpg': 'jpg',
+    'pjpeg': 'jpg',
+    'jfif': 'jpg',
+    'png': 'png',
+    'x-png': 'png',
+    'webp': 'webp',
+    'gif': 'gif',
+});
+
+const IIG_UPLOAD_ALLOWED_FORMATS = new Set(['jpg', 'png', 'webp', 'gif']);
+
+function parseImageDataUrl(dataUrl) {
+    if (typeof dataUrl !== 'string') {
+        throw new Error(`Invalid data URL type: ${typeof dataUrl}`);
     }
-    
-    const format = match[1]; // png, jpeg, webp
-    const base64Data = match[2];
+    if (!dataUrl.startsWith('data:')) {
+        throw new Error('Invalid data URL prefix (expected data:)');
+    }
+
+    const commaIdx = dataUrl.indexOf(',');
+    if (commaIdx <= 5) {
+        throw new Error('Invalid data URL format (missing comma)');
+    }
+
+    const meta = dataUrl.slice(5, commaIdx).trim();
+    const base64Data = dataUrl.slice(commaIdx + 1).trim();
+    const metaParts = meta.split(';').map(s => s.trim()).filter(Boolean);
+    const mimeType = (metaParts[0] || '').toLowerCase();
+    const hasBase64 = metaParts.some(p => p.toLowerCase() === 'base64');
+
+    if (!mimeType.startsWith('image/')) {
+        throw new Error(`Invalid data URL mime type: ${mimeType || '(empty)'}`);
+    }
+    if (!hasBase64) {
+        throw new Error('Invalid data URL encoding (base64 flag missing)');
+    }
+    if (!base64Data) {
+        throw new Error('Invalid data URL payload (empty base64)');
+    }
+
+    const subtype = mimeType.slice('image/'.length).toLowerCase();
+    const normalizedFormat = IIG_UPLOAD_FORMAT_MAP[subtype] || subtype;
+
+    return {
+        mimeType,
+        subtype,
+        normalizedFormat,
+        base64Data,
+    };
+}
+
+async function convertDataUrlToPng(dataUrl) {
+    return await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const width = img.naturalWidth || img.width;
+            const height = img.naturalHeight || img.height;
+            if (!width || !height) {
+                reject(new Error('Image decode failed (no dimensions)'));
+                return;
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                reject(new Error('Canvas 2D context unavailable'));
+                return;
+            }
+            ctx.drawImage(img, 0, 0);
+            resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = () => reject(new Error('Failed to decode data URL image'));
+        img.src = dataUrl;
+    });
+}
+
+async function saveImageToFile(dataUrl, debugMeta = {}) {
+    const context = SillyTavern.getContext();
+
+    let parsed;
+    try {
+        parsed = parseImageDataUrl(dataUrl);
+    } catch (error) {
+        iigLog(
+            'ERROR',
+            `saveImageToFile parse failed: ${error.message}; debug=${JSON.stringify(debugMeta)}; prefix=${String(dataUrl).slice(0, 120)}`
+        );
+        throw error;
+    }
+
+    if (!IIG_UPLOAD_ALLOWED_FORMATS.has(parsed.normalizedFormat)) {
+        iigLog(
+            'WARN',
+            `Unsupported upload format "${parsed.subtype}" (mime=${parsed.mimeType}); converting to PNG; debug=${JSON.stringify(debugMeta)}`
+        );
+        const converted = await convertDataUrlToPng(dataUrl);
+        parsed = parseImageDataUrl(converted);
+    }
+
+    const format = parsed.normalizedFormat;
+    const base64Data = parsed.base64Data;
+    iigLog(
+        'INFO',
+        `Uploading image: mime=${parsed.mimeType} subtype=${parsed.subtype} format=${format} b64len=${base64Data.length} debug=${JSON.stringify(debugMeta)}`
+    );
     
     // Get character name for subfolder
     let charName = 'generated';
@@ -286,12 +655,62 @@ async function saveImageToFile(dataUrl) {
     });
     
     if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(error.error || `Upload failed: ${response.status}`);
+        const raw = await response.text().catch(() => '');
+        let parsedError = {};
+        try {
+            parsedError = raw ? JSON.parse(raw) : {};
+        } catch (_e) {
+            parsedError = {};
+        }
+        const errText = parsedError?.error || parsedError?.detail || raw || `Upload failed: ${response.status}`;
+        iigLog(
+            'ERROR',
+            `Upload failed status=${response.status} format=${format} mime=${parsed.mimeType} debug=${JSON.stringify(debugMeta)} response=${String(errText).slice(0, 400)}`
+        );
+        throw new Error(errText);
     }
     
     const result = await response.json();
     console.log('[IIG] Image saved to:', result.path);
+    return result.path;
+}
+
+async function saveNaisteraMediaToFile(dataUrl, mediaKind = 'video', debugMeta = {}) {
+    if (mediaKind !== 'video') {
+        throw new Error(`Unsupported mediaKind for file upload: ${mediaKind}`);
+    }
+
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:video/mp4;base64,')) {
+        throw new Error('Only data:video/mp4;base64 URLs are supported');
+    }
+
+    const context = SillyTavern.getContext();
+    const base64Data = dataUrl.slice('data:video/mp4;base64,'.length).trim();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileName = `iig_video_${timestamp}.mp4`;
+
+    const response = await fetch('/api/files/upload', {
+        method: 'POST',
+        headers: context.getRequestHeaders(),
+        body: JSON.stringify({
+            name: fileName,
+            data: base64Data,
+        })
+    });
+
+    if (!response.ok) {
+        const raw = await response.text().catch(() => '');
+        iigLog(
+            'ERROR',
+            `ST media upload failed status=${response.status} kind=${mediaKind} debug=${JSON.stringify(debugMeta)} response=${String(raw).slice(0, 400)}`
+        );
+        throw new Error(raw || `Media upload failed: ${response.status}`);
+    }
+
+    const result = await response.json();
+    if (!result?.path) {
+        throw new Error('No path in media upload response');
+    }
     return result.path;
 }
 
@@ -486,8 +905,8 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     // Build parts array
     const parts = [];
     
-    // Add reference images first (up to 4)
-    for (const imgB64 of referenceImages.slice(0, 4)) {
+    // Add reference images first
+    for (const imgB64 of referenceImages.slice(0, MAX_GENERATION_REFERENCE_IMAGES)) {
         parts.push({
             inlineData: {
                 mimeType: 'image/png',
@@ -585,34 +1004,61 @@ async function getUserAvatarDataUrl() {
  * Generate image via Naistera custom endpoint
  * POST {endpoint}/api/generate
  * Auth: Authorization: Bearer <token>
- * Response: { data_url, content_type }
+ * Response: { data_url, content_type, media_kind?, poster_data_url? }
  */
 async function generateImageNaistera(prompt, style, options = {}) {
     const settings = getSettings();
-    const endpoint = settings.endpoint.replace(/\/$/, '');
+    const endpoint = getEffectiveEndpoint(settings);
     const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
 
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
 
     const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
-    const preset = options.preset || settings.naisteraPreset || null;
+    const model = normalizeNaisteraModel(options.model || settings.naisteraModel || 'grok');
+    const preset = options.preset || null;
     const referenceImages = options.referenceImages || [];
+    const wantsVideoTest = Boolean(options.videoTestMode);
+    const videoEveryN = normalizeNaisteraVideoFrequency(options.videoEveryN ?? settings.naisteraVideoEveryN);
 
     const body = {
         prompt: fullPrompt,
         aspect_ratio: aspectRatio,
+        model,
     };
     if (preset) body.preset = preset;
-    if (referenceImages.length > 0) body.reference_images = referenceImages.slice(0, 4);
+    if (referenceImages.length > 0) {
+        body.reference_images = referenceImages.slice(0, MAX_GENERATION_REFERENCE_IMAGES);
+    }
+    if (wantsVideoTest) {
+        body.video_test_mode = true;
+        body.video_test_every_n_messages = videoEveryN;
+    }
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${settings.apiKey}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-    });
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${settings.apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(body)
+        });
+    } catch (error) {
+        const pageOrigin = window.location.origin;
+        let endpointOrigin = endpoint;
+        try {
+            endpointOrigin = new URL(url, window.location.href).origin;
+        } catch (parseErr) {
+            console.warn('[IIG] Failed to parse Naistera endpoint origin:', parseErr);
+        }
+        const rawMessage = String(error?.message || '').trim() || 'Failed to fetch';
+        throw new Error(
+            `Network/CORS error while requesting ${endpointOrigin} from ${pageOrigin}. `
+            + `The browser blocked access to the response before the API could return JSON. `
+            + `Original error: ${rawMessage}`
+        );
+    }
 
     if (!response.ok) {
         const text = await response.text();
@@ -623,7 +1069,14 @@ async function generateImageNaistera(prompt, style, options = {}) {
     if (!result?.data_url) {
         throw new Error('No data_url in response');
     }
-
+    if (result.media_kind === 'video') {
+        return {
+            kind: 'video',
+            dataUrl: result.data_url,
+            posterDataUrl: result.poster_data_url || '',
+            contentType: result.content_type || 'video/mp4',
+        };
+    }
     return result.data_url;
 }
 
@@ -635,13 +1088,21 @@ function validateSettings() {
     const errors = [];
     
     if (!settings.endpoint) {
-        errors.push('URL эндпоинта не настроен');
+        if (settings.apiType !== 'naistera') {
+            errors.push('URL эндпоинта не настроен');
+        }
     }
     if (!settings.apiKey) {
         errors.push('API ключ не настроен');
     }
     if (settings.apiType !== 'naistera' && !settings.model) {
         errors.push('Модель не выбрана');
+    }
+    if (settings.apiType === 'naistera') {
+        const m = normalizeNaisteraModel(settings.naisteraModel);
+        if (!NAISTERA_MODELS.includes(m)) {
+            errors.push('Для Naistera выберите модель: grok / nano banana');
+        }
     }
     
     if (errors.length > 0) {
@@ -656,6 +1117,48 @@ function sanitizeForHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+function isGeneratedVideoResult(value) {
+    return Boolean(value) && typeof value === 'object' && value.kind === 'video' && typeof value.dataUrl === 'string';
+}
+
+function createGeneratedMediaElement(result, tag) {
+    if (isGeneratedVideoResult(result)) {
+        const video = document.createElement('video');
+        video.className = 'iig-generated-video';
+        video.src = result.dataUrl;
+        video.controls = true;
+        video.autoplay = true;
+        video.loop = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.title = `Style: ${tag.style}\nPrompt: ${tag.prompt}`;
+        if (result.posterDataUrl) {
+            video.poster = result.posterDataUrl;
+        }
+        return video;
+    }
+
+    const img = document.createElement('img');
+    img.className = 'iig-generated-image';
+    img.src = result;
+    img.alt = tag.prompt;
+    img.title = `Style: ${tag.style}\nPrompt: ${tag.prompt}`;
+    return img;
+}
+
+function buildPersistedVideoTag(templateHtml, persistedSrc, posterSrc = '') {
+    let html = String(templateHtml || '').trim()
+        .replace(/^<(?:img|video)\b/i, '<video controls autoplay loop muted playsinline')
+        .replace(/<\/video>\s*$/i, '')
+        .replace(/\/?>\s*$/i, '')
+        .replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+    html = html.replace(/\s+poster\s*=\s*(['"])[\s\S]*?\1/i, '');
+    if (posterSrc) {
+        html = html.replace(/^<video\b/i, `<video poster="${sanitizeForHtml(posterSrc)}"`);
+    }
+    return `${html}></video>`;
 }
 
 /**
@@ -700,21 +1203,84 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             if (d) referenceDataUrls.push(d);
         }
     }
+
+    if (settings.imageContextEnabled) {
+        const contextCount = normalizeImageContextCount(settings.imageContextCount);
+        if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+            const contextRefs = await collectPreviousContextReferences(
+                options.messageId,
+                'base64',
+                contextCount
+            );
+            referenceImages.push(...contextRefs);
+        }
+        if (settings.apiType === 'naistera') {
+            const contextRefs = await collectPreviousContextReferences(
+                options.messageId,
+                'dataUrl',
+                contextCount
+            );
+            referenceDataUrls.push(...contextRefs);
+        }
+    }
+
+    if (referenceImages.length > MAX_GENERATION_REFERENCE_IMAGES) {
+        referenceImages.length = MAX_GENERATION_REFERENCE_IMAGES;
+    }
+    if (referenceDataUrls.length > MAX_GENERATION_REFERENCE_IMAGES) {
+        referenceDataUrls.length = MAX_GENERATION_REFERENCE_IMAGES;
+    }
+
+    const enableVideoTest = settings.apiType === 'naistera'
+        && settings.naisteraVideoTest
+        && shouldUseNaisteraVideoTest(options.model || settings.naisteraModel)
+        && shouldTriggerNaisteraVideoForMessage(options.messageId, settings.naisteraVideoEveryN);
     
     let lastError;
     
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
-            
+            let generated;
             // Choose API based on type or model
             if (settings.apiType === 'naistera') {
-                return await generateImageNaistera(prompt, style, { ...options, referenceImages: referenceDataUrls });
+                generated = await generateImageNaistera(prompt, style, {
+                    ...options,
+                    referenceImages: referenceDataUrls,
+                    videoTestMode: enableVideoTest,
+                    videoEveryN: settings.naisteraVideoEveryN,
+                });
             } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
-                return await generateImageGemini(prompt, style, referenceImages, options);
+                generated = await generateImageGemini(prompt, style, referenceImages, options);
             } else {
-                return await generateImageOpenAI(prompt, style, referenceImages, options);
+                generated = await generateImageOpenAI(prompt, style, referenceImages, options);
             }
+
+            if (generated && typeof generated === 'object' && generated.kind === 'video') {
+                iigLog(
+                    'INFO',
+                    `Generation result: apiType=${settings.apiType} kind=video mime=${generated.contentType} poster=${generated.posterDataUrl ? 'yes' : 'no'}`
+                );
+            } else if (typeof generated === 'string' && generated.startsWith('data:')) {
+                try {
+                    const parsed = parseImageDataUrl(generated);
+                    iigLog(
+                        'INFO',
+                        `Generation result: apiType=${settings.apiType} mime=${parsed.mimeType} subtype=${parsed.subtype} b64len=${parsed.base64Data.length}`
+                    );
+                } catch (parseErr) {
+                    iigLog(
+                        'WARN',
+                        `Generation result has unparsable data URL: ${parseErr.message}; prefix=${generated.slice(0, 120)}`
+                    );
+                }
+            } else {
+                iigLog(
+                    'INFO',
+                    `Generation result is non-data-url: apiType=${settings.apiType} value=${String(generated).slice(0, 160)}`
+                );
+            }
+            return generated;
         } catch (error) {
             lastError = error;
             console.error(`[IIG] Generation attempt ${attempt + 1} failed:`, error);
@@ -755,7 +1321,7 @@ async function checkFileExists(path) {
 /**
  * Parse image generation tags from message text
  * Supports two formats:
- * 1. NEW: <img data-iig-instruction='{"style":"...","prompt":"..."}' src="[IMG:GEN]">
+ * 1. NEW: <img|video data-iig-instruction='{"style":"...","prompt":"..."}' src="...">
  * 2. LEGACY: [IMG:GEN:{"style":"...","prompt":"..."}]
  * 
  * @param {string} text - Message text
@@ -767,7 +1333,7 @@ async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
     const tags = [];
     
-    // === NEW FORMAT: <img data-iig-instruction="{...}" src="[IMG:GEN]"> ===
+    // === NEW FORMAT: <img|video data-iig-instruction="{...}" src="..."> ===
     // LLM often generates broken HTML with unescaped quotes, so we parse manually
     const imgTagMarker = 'data-iig-instruction=';
     let searchPos = 0;
@@ -776,9 +1342,13 @@ async function parseImageTags(text, options = {}) {
         const markerPos = text.indexOf(imgTagMarker, searchPos);
         if (markerPos === -1) break;
         
-        // Find the start of the <img tag
-        let imgStart = text.lastIndexOf('<img', markerPos);
-        if (imgStart === -1 || markerPos - imgStart > 500) {
+        // Find the start of the media tag.
+        const imgStart = text.lastIndexOf('<img', markerPos);
+        const videoStart = text.lastIndexOf('<video', markerPos);
+        const mediaStart = Math.max(imgStart, videoStart);
+        const isVideoTag = mediaStart === videoStart && videoStart !== -1;
+        const tagName = isVideoTag ? 'video' : 'img';
+        if (mediaStart === -1 || markerPos - mediaStart > 800) {
             searchPos = markerPos + 1;
             continue;
         }
@@ -833,15 +1403,25 @@ async function parseImageTags(text, options = {}) {
             continue;
         }
         
-        // Find the end of the <img> tag
-        let imgEnd = text.indexOf('>', jsonEnd);
-        if (imgEnd === -1) {
+        // Find the end of the media tag.
+        let mediaEnd = -1;
+        if (isVideoTag) {
+            mediaEnd = text.indexOf('</video>', jsonEnd);
+            if (mediaEnd !== -1) {
+                mediaEnd += '</video>'.length;
+            }
+        } else {
+            mediaEnd = text.indexOf('>', jsonEnd);
+            if (mediaEnd !== -1) {
+                mediaEnd += 1;
+            }
+        }
+        if (mediaEnd === -1) {
             searchPos = markerPos + 1;
             continue;
         }
-        imgEnd++; // Include the >
-        
-        const fullImgTag = text.substring(imgStart, imgEnd);
+
+        const fullImgTag = text.substring(mediaStart, mediaEnd);
         const instructionJson = text.substring(jsonStart, jsonEnd);
         
         // Check if src needs generation
@@ -903,7 +1483,7 @@ async function parseImageTags(text, options = {}) {
             
             tags.push({
                 fullMatch: fullImgTag,
-                index: imgStart,
+                index: mediaStart,
                 style: data.style || '',
                 prompt: data.prompt || '',
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
@@ -911,6 +1491,7 @@ async function parseImageTags(text, options = {}) {
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
                 isNewFormat: true,
+                mediaTagName: tagName,
                 existingSrc: hasPath ? srcValue : null // Store existing src for logging
             });
             
@@ -919,7 +1500,7 @@ async function parseImageTags(text, options = {}) {
             iigLog('WARN', `Failed to parse instruction JSON: ${instructionJson.substring(0, 100)}`, e.message);
         }
         
-        searchPos = imgEnd;
+        searchPos = mediaEnd;
     }
     
     // === LEGACY FORMAT: [IMG:GEN:{...}] ===
@@ -1070,7 +1651,7 @@ async function processMessageTags(messageId) {
     if (!message || message.is_user) return;
     
     // Check for tags, with file existence check to catch LLM hallucinations
-    const tags = await parseImageTags(message.mes, { checkExistence: true });
+    const tags = await parseMessageImageTags(message, { checkExistence: true });
     iigLog('INFO', `parseImageTags returned: ${tags.length} tags`);
     if (tags.length > 0) {
         iigLog('INFO', `First tag: ${JSON.stringify(tags[0]).substring(0, 200)}`);
@@ -1107,10 +1688,9 @@ async function processMessageTags(messageId) {
         let targetElement = null;
         
         if (tag.isNewFormat) {
-            // NEW FORMAT: <img data-iig-instruction='...'> is a real DOM element
-            // Find it by looking for img with data-iig-instruction attribute
-            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction]');
-            iigLog('INFO', `Searching for img element. Found ${allImgs.length} img[data-iig-instruction] elements in DOM`);
+            // NEW FORMAT: <img|video data-iig-instruction='...'> is a real DOM element
+            const allImgs = mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]');
+            iigLog('INFO', `Searching for media element. Found ${allImgs.length} [data-iig-instruction] elements in DOM`);
             
             // Debug: log what we're looking for vs what's in DOM
             const searchPrompt = tag.prompt.substring(0, 30);
@@ -1182,11 +1762,11 @@ async function processMessageTags(messageId) {
                 }
             }
             
-            // Strategy 4: If still not found, try looking at ALL imgs (not just those with data-iig-instruction attr)
+            // Strategy 4: If still not found, try looking at all media nodes
             // This handles cases where browser didn't parse data-iig-instruction as a valid attribute
             if (!targetElement) {
-                iigLog('INFO', `Trying broader img search...`);
-                const allImgsInMes = mesTextEl.querySelectorAll('img');
+                iigLog('INFO', `Trying broader media search...`);
+                const allImgsInMes = mesTextEl.querySelectorAll('img, video');
                 for (const img of allImgsInMes) {
                     const src = img.getAttribute('src') || '';
                     // Look for src containing our markers
@@ -1217,7 +1797,7 @@ async function processMessageTags(messageId) {
             
             // Also check for img src containing legacy tag
             if (!targetElement) {
-                const allImgs = mesTextEl.querySelectorAll('img');
+                const allImgs = mesTextEl.querySelectorAll('img, video');
                 for (const img of allImgs) {
                     if (img.src && img.src.includes('[IMG:GEN:')) {
                         targetElement = img;
@@ -1248,50 +1828,77 @@ async function processMessageTags(messageId) {
         const statusEl = loadingPlaceholder.querySelector('.iig-status');
         
         try {
-            const dataUrl = await generateImageWithRetry(
+            const generated = await generateImageWithRetry(
                 tag.prompt,
                 tag.style,
                 (status) => { statusEl.textContent = status; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId }
             );
-            
-            // Save image to file instead of keeping base64
-            statusEl.textContent = 'Сохранение...';
-            const imagePath = await saveImageToFile(dataUrl);
-            
-            // Replace placeholder with actual image
-            const img = document.createElement('img');
-            img.className = 'iig-generated-image';
-            img.src = imagePath;
-            img.alt = tag.prompt;
-            img.title = `Style: ${tag.style}\nPrompt: ${tag.prompt}`;
-            
+
+            let persistedSrc = '';
+            let persistedPosterSrc = '';
+            if (isGeneratedVideoResult(generated)) {
+                statusEl.textContent = 'Сохранение видео...';
+                persistedSrc = await saveNaisteraMediaToFile(generated.dataUrl, 'video', {
+                    messageId,
+                    tagIndex: index,
+                    mode: 'generate-video',
+                    apiType: getSettings().apiType,
+                });
+                if (generated.posterDataUrl) {
+                    statusEl.textContent = 'Сохранение превью...';
+                    persistedPosterSrc = await saveImageToFile(generated.posterDataUrl, {
+                        messageId,
+                        tagIndex: index,
+                        mode: 'generate-video-poster',
+                        apiType: getSettings().apiType,
+                    });
+                }
+            } else {
+                statusEl.textContent = 'Сохранение...';
+                persistedSrc = await saveImageToFile(generated, {
+                    messageId,
+                    tagIndex: index,
+                    mode: 'generate',
+                    apiType: getSettings().apiType,
+                });
+            }
+
+            const mediaElement = createGeneratedMediaElement(
+                isGeneratedVideoResult(generated)
+                    ? { ...generated, dataUrl: persistedSrc, posterDataUrl: persistedPosterSrc || generated.posterDataUrl || '' }
+                    : persistedSrc,
+                tag,
+            );
+
             // Preserve instruction for future regenerations (new format only)
             if (tag.isNewFormat) {
                 const instructionMatch = tag.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
                 if (instructionMatch) {
-                    img.setAttribute('data-iig-instruction', instructionMatch[2]);
+                    mediaElement.setAttribute('data-iig-instruction', instructionMatch[2]);
                 }
             }
-            
-            loadingPlaceholder.replaceWith(img);
-            
-            // Update message.mes to persist the image
+
+            loadingPlaceholder.replaceWith(mediaElement);
+
             if (tag.isNewFormat) {
-                // NEW FORMAT: <img data-iig-instruction="..." src="[IMG:GEN]">
-                // Just update the src attribute with the real path
-                // LLM sees same format but with real path = already generated
-                const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
-                message.mes = message.mes.replace(tag.fullMatch, updatedTag);
+                const updatedTag = isGeneratedVideoResult(generated)
+                    ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
+                    : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+                replaceTagInMessageSource(message, tag, updatedTag);
             } else {
-                // LEGACY FORMAT: [IMG:GEN:{...}]
-                // Replace with completion marker so LLM doesn't copy it
-                const completionMarker = `[IMG:✓:${imagePath}]`;
-                message.mes = message.mes.replace(tag.fullMatch, completionMarker);
+                const completionMarker = isGeneratedVideoResult(generated)
+                    ? `[VID:✓:${persistedSrc}]`
+                    : `[IMG:✓:${persistedSrc}]`;
+                replaceTagInMessageSource(message, tag, completionMarker);
             }
-            
-            iigLog('INFO', `Successfully generated image for tag ${index}`);
-            toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
+
+            iigLog('INFO', `Successfully generated ${isGeneratedVideoResult(generated) ? 'video' : 'image'} for tag ${index}`);
+            toastr.success(
+                `${isGeneratedVideoResult(generated) ? 'Видео' : 'Картинка'} ${index + 1}/${tags.length} готов${isGeneratedVideoResult(generated) ? 'о' : 'а'}`,
+                'Генерация картинок',
+                { timeOut: 2000 }
+            );
         } catch (error) {
             iigLog('ERROR', `Failed to generate image for tag ${index}:`, error.message);
             
@@ -1303,11 +1910,11 @@ async function processMessageTags(messageId) {
             if (tag.isNewFormat) {
                 // NEW FORMAT: update src with error image path (will be detected for retry)
                 const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${ERROR_IMAGE_PATH}"`);
-                message.mes = message.mes.replace(tag.fullMatch, errorTag);
+                replaceTagInMessageSource(message, tag, errorTag);
             } else {
                 // LEGACY FORMAT: replace with error marker
                 const errorMarker = `[IMG:ERROR:${error.message.substring(0, 50)}]`;
-                message.mes = message.mes.replace(tag.fullMatch, errorMarker);
+                replaceTagInMessageSource(message, tag, errorMarker);
             }
             iigLog('INFO', `Marked tag as failed in message.mes`);
             
@@ -1331,7 +1938,7 @@ async function processMessageTags(messageId) {
     // Use SillyTavern's messageFormatting if available
     if (typeof context.messageFormatting === 'function') {
         const formattedMessage = context.messageFormatting(
-            message.mes,
+            getMessageRenderText(message, settings),
             message.name,
             message.is_system,
             message.is_user,
@@ -1363,7 +1970,7 @@ async function regenerateMessageImages(messageId) {
     }
     
     // Parse ALL instruction tags, forcing regeneration
-    const tags = await parseImageTags(message.mes, { forceAll: true });
+    const tags = await parseMessageImageTags(message, { forceAll: true });
     
     if (tags.length === 0) {
         toastr.warning('Нет тегов для перегенерации', 'Генерация картинок');
@@ -1393,42 +2000,78 @@ async function regenerateMessageImages(messageId) {
         const tagId = `iig-regen-${messageId}-${index}`;
         
         try {
-            // Find the existing img element with data-iig-instruction
-            const existingImg = mesTextEl.querySelector(`img[data-iig-instruction]`);
-            if (existingImg) {
+            // Find the existing rendered media element with data-iig-instruction
+            const existingMediaList = Array.from(
+                mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
+            );
+            const existingMedia = existingMediaList[index] || existingMediaList[0] || null;
+            if (existingMedia) {
                 // Preserve the instruction for future regenerations
-                const instruction = existingImg.getAttribute('data-iig-instruction');
+                const instruction = existingMedia.getAttribute('data-iig-instruction');
                 
                 const loadingPlaceholder = createLoadingPlaceholder(tagId);
-                existingImg.replaceWith(loadingPlaceholder);
+                existingMedia.replaceWith(loadingPlaceholder);
                 
                 const statusEl = loadingPlaceholder.querySelector('.iig-status');
                 
-                const dataUrl = await generateImageWithRetry(
+                const generated = await generateImageWithRetry(
                     tag.prompt,
                     tag.style,
                     (status) => { statusEl.textContent = status; },
-                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset }
+                    { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId }
                 );
-                
-                statusEl.textContent = 'Сохранение...';
-                const imagePath = await saveImageToFile(dataUrl);
-                
-                const img = document.createElement('img');
-                img.className = 'iig-generated-image';
-                img.src = imagePath;
-                img.alt = tag.prompt;
-                // Preserve instruction for future regenerations
-                if (instruction) {
-                    img.setAttribute('data-iig-instruction', instruction);
+
+                let persistedSrc = '';
+                let persistedPosterSrc = '';
+                if (isGeneratedVideoResult(generated)) {
+                    statusEl.textContent = 'Сохранение видео...';
+                    persistedSrc = await saveNaisteraMediaToFile(generated.dataUrl, 'video', {
+                        messageId,
+                        tagIndex: index,
+                        mode: 'regenerate-video',
+                        apiType: getSettings().apiType,
+                    });
+                    if (generated.posterDataUrl) {
+                        statusEl.textContent = 'Сохранение превью...';
+                        persistedPosterSrc = await saveImageToFile(generated.posterDataUrl, {
+                            messageId,
+                            tagIndex: index,
+                            mode: 'regenerate-video-poster',
+                            apiType: getSettings().apiType,
+                        });
+                    }
+                } else {
+                    statusEl.textContent = 'Сохранение...';
+                    persistedSrc = await saveImageToFile(generated, {
+                        messageId,
+                        tagIndex: index,
+                        mode: 'regenerate',
+                        apiType: getSettings().apiType,
+                    });
                 }
-                loadingPlaceholder.replaceWith(img);
+
+                const mediaElement = createGeneratedMediaElement(
+                    isGeneratedVideoResult(generated)
+                        ? { ...generated, dataUrl: persistedSrc, posterDataUrl: persistedPosterSrc || generated.posterDataUrl || '' }
+                        : persistedSrc,
+                    tag,
+                );
+                if (instruction) {
+                    mediaElement.setAttribute('data-iig-instruction', instruction);
+                }
+                loadingPlaceholder.replaceWith(mediaElement);
                 
                 // Update message.mes
-                const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
-                message.mes = message.mes.replace(tag.fullMatch, updatedTag);
+                const updatedTag = isGeneratedVideoResult(generated)
+                    ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
+                    : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+                replaceTagInMessageSource(message, tag, updatedTag);
                 
-                toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
+                toastr.success(
+                    `${isGeneratedVideoResult(generated) ? 'Видео' : 'Картинка'} ${index + 1}/${tags.length} готов${isGeneratedVideoResult(generated) ? 'о' : 'а'}`,
+                    'Генерация картинок',
+                    { timeOut: 2000 }
+                );
             }
         } catch (error) {
             iigLog('ERROR', `Regeneration failed for tag ${index}:`, error.message);
@@ -1544,6 +2187,10 @@ function createSettingsUI() {
                         <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
                         <span>Включить генерацию картинок</span>
                     </label>
+                    <label class="checkbox_label" style="margin-top: 6px;">
+                        <input type="checkbox" id="iig_external_blocks" ${settings.externalBlocks ? 'checked' : ''}>
+                        <span>Работа с внешними блоками</span>
+                    </label>
                     
                     <hr>
                     
@@ -1555,7 +2202,7 @@ function createSettingsUI() {
                         <select id="iig_api_type" class="flex1">
                             <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
                             <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
-                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera/Grok (naistera.org)</option>
+                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (naistera.org)</option>
                         </select>
                     </div>
                     
@@ -1576,7 +2223,7 @@ function createSettingsUI() {
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
-                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera/Grok: вставьте токен из Telegram бота. Модель не требуется.</p>
+                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / nano banana).</p>
                     
                     <!-- Модель -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
@@ -1590,49 +2237,100 @@ function createSettingsUI() {
                     </div>
                     
                     <hr>
-                    
-                    <h4>Параметры генерации</h4>
-                    
-                    <!-- Размер -->
-                    <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
-                        <label for="iig_size">Размер</label>
-                        <select id="iig_size" class="flex1">
-                            <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
-                            <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
-                            <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
-                            <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
-                        </select>
-                    </div>
-                    
-                    <!-- Качество -->
-                    <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
-                        <label for="iig_quality">Качество</label>
-                        <select id="iig_quality" class="flex1">
-                            <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
-                            <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
-                        </select>
+
+                    <div class="iig-settings-card ${['naistera', 'gemini'].includes(settings.apiType) ? '' : 'iig-hidden'}" id="iig_image_context_section">
+                        <h4>Контекст картинок</h4>
+                        <p class="hint">Добавляет к генерации несколько предыдущих картинок из чата как контекст сцен и стиля.</p>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="iig_image_context_enabled" ${settings.imageContextEnabled ? 'checked' : ''}>
+                            <span>Включить контекст картинок</span>
+                        </label>
+                        <div class="iig-video-frequency-row ${settings.imageContextEnabled ? '' : 'iig-hidden'}" id="iig_image_context_count_row">
+                            <div class="iig-video-frequency-input">
+                                <span>Использовать</span>
+                                <input
+                                    type="number"
+                                    id="iig_image_context_count"
+                                    class="text_pole"
+                                    min="1"
+                                    max="${MAX_CONTEXT_IMAGES}"
+                                    step="1"
+                                    value="${normalizeImageContextCount(settings.imageContextCount)}"
+                                >
+                                <span>предыдущих картинок.</span>
+                            </div>
+                        </div>
                     </div>
 
-                    <!-- Naistera params -->
-                    <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
-                        <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
-                        <select id="iig_naistera_aspect_ratio" class="flex1">
-                            <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
-                            <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
-                            <option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
-                        </select>
-                    </div>
-                    <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_preset_row">
-                        <label for="iig_naistera_preset">Пресеты</label>
-                        <select id="iig_naistera_preset" class="flex1">
-                            <option value="" ${!settings.naisteraPreset ? 'selected' : ''}>без пресета</option>
-                            <option value="digital" ${settings.naisteraPreset === 'digital' ? 'selected' : ''}>digital</option>
-                            <option value="realism" ${settings.naisteraPreset === 'realism' ? 'selected' : ''}>realism</option>
-                        </select>
+                    <div class="iig-settings-card">
+                        <h4>Параметры генерации</h4>
+
+                        <!-- Размер -->
+                        <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
+                            <label for="iig_size">Размер</label>
+                            <select id="iig_size" class="flex1">
+                                <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
+                                <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
+                                <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
+                                <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
+                            </select>
+                        </div>
+
+                        <!-- Качество -->
+                        <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
+                            <label for="iig_quality">Качество</label>
+                            <select id="iig_quality" class="flex1">
+                                <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
+                                <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
+                            </select>
+                        </div>
+
+                        <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_model_row">
+                            <label for="iig_naistera_model">Модель</label>
+                            <select id="iig_naistera_model" class="flex1">
+                                <option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>grok</option>
+                                <option value="nano banana" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana' ? 'selected' : ''}>nano banana</option>
+                            </select>
+                        </div>
+                        <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
+                            <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
+                            <select id="iig_naistera_aspect_ratio" class="flex1">
+                                <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
+                                <option value="16:9" ${settings.naisteraAspectRatio === '16:9' ? 'selected' : ''}>16:9</option>
+                                <option value="9:16" ${settings.naisteraAspectRatio === '9:16' ? 'selected' : ''}>9:16</option>
+                                <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
+                                <option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
+                            </select>
+                        </div>
+
+                        <div id="iig_avatar_section" class="iig-settings-card-nested ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                            <div class="flex-row">
+                                <label for="iig_aspect_ratio">Соотношение сторон</label>
+                                <select id="iig_aspect_ratio" class="flex1">
+                                    <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
+                                    <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
+                                    <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
+                                    <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
+                                    <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
+                                    <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
+                                    <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
+                                    <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
+                                    <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
+                                    <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
+                                </select>
+                            </div>
+                            <div class="flex-row">
+                                <label for="iig_image_size">Разрешение</label>
+                                <select id="iig_image_size" class="flex1">
+                                    <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
+                                    <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
+                                    <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
+                                </select>
+                            </div>
+                        </div>
                     </div>
 
-                    <!-- Naistera references (UI only for now) -->
-                    <div class="iig-naistera-refs ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
+                    <div class="iig-settings-card ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
                         <h4>Референсы</h4>
                         <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
                         <label class="checkbox_label">
@@ -1643,8 +2341,6 @@ function createSettingsUI() {
                             <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
                             <span>Отправлять аватар {{user}}</span>
                         </label>
-
-                        <!-- User Avatar Selection (reuses common userAvatarFile setting) -->
                         <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}" style="margin-top: 5px;">
                             <label for="iig_naistera_user_avatar_file">Аватар {{user}}</label>
                             <select id="iig_naistera_user_avatar_file" class="flex1">
@@ -1656,56 +2352,18 @@ function createSettingsUI() {
                             </div>
                         </div>
                     </div>
-                    
-                    <hr>
-                    
-                    <!-- Опции для Nano-Banana -->
-                    <div id="iig_avatar_section" class="iig-avatar-section ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
-                        <h4>Настройки Nano-Banana</h4>
-                        
-                        <!-- Aspect Ratio -->
-                        <div class="flex-row">
-                            <label for="iig_aspect_ratio">Соотношение сторон</label>
-                            <select id="iig_aspect_ratio" class="flex1">
-                                <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
-                                <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
-                                <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
-                                <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
-                                <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
-                                <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
-                                <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
-                                <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
-                                <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
-                                <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
-                            </select>
-                        </div>
-                        
-                        <!-- Image Size -->
-                        <div class="flex-row">
-                            <label for="iig_image_size">Разрешение</label>
-                            <select id="iig_image_size" class="flex1">
-                                <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
-                                <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
-                                <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
-                            </select>
-                        </div>
-                        
-                        <hr>
-                        
-                        <h5>Референсы</h5>
+
+                    <div id="iig_avatar_refs_section" class="iig-settings-card ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                        <h4>Референсы</h4>
                         <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
-                        
                         <label class="checkbox_label">
                             <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
                             <span>Отправлять аватар {{char}}</span>
                         </label>
-                        
                         <label class="checkbox_label">
                             <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
                             <span>Отправлять аватар {{user}}</span>
                         </label>
-                        
-                        <!-- User Avatar Selection -->
                         <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
                             <label for="iig_user_avatar_file">Аватар {{user}}</label>
                             <select id="iig_user_avatar_file" class="flex1">
@@ -1717,35 +2375,56 @@ function createSettingsUI() {
                             </div>
                         </div>
                     </div>
-                    
-                    <hr>
-                    
-                    <h4>Обработка ошибок</h4>
-                    
-                    <!-- Макс. повторов -->
-                    <div class="flex-row">
-                        <label for="iig_max_retries">Макс. повторов</label>
-                        <input type="number" id="iig_max_retries" class="text_pole flex1" 
-                               value="${settings.maxRetries}" min="0" max="5">
-                    </div>
-                    
-                    <!-- Задержка -->
-                    <div class="flex-row">
-                        <label for="iig_retry_delay">Задержка (мс)</label>
-                        <input type="number" id="iig_retry_delay" class="text_pole flex1" 
-                               value="${settings.retryDelay}" min="500" max="10000" step="500">
-                    </div>
-                    
-                    <hr>
-                    
-                    <h4>Отладка</h4>
-                    
-                    <div class="flex-row">
-                        <div id="iig_export_logs" class="menu_button" style="width: 100%;">
-                            <i class="fa-solid fa-download"></i> Экспорт логов
+
+                    <div class="iig-settings-card ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_video_section">
+                        <h4>Видео</h4>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="iig_naistera_video_test" ${settings.naisteraVideoTest ? 'checked' : ''}>
+                            <span>Включить генерацию видео</span>
+                        </label>
+                        <div class="iig-video-frequency-row ${settings.naisteraVideoTest ? '' : 'iig-hidden'}" id="iig_naistera_video_frequency_row">
+                            <div class="iig-video-frequency-input">
+                                <span>Каждые</span>
+                                <input
+                                    type="number"
+                                    id="iig_naistera_video_every_n"
+                                    class="text_pole"
+                                    min="1"
+                                    max="999"
+                                    step="1"
+                                    value="${normalizeNaisteraVideoFrequency(settings.naisteraVideoEveryN)}"
+                                >
+                                <span>сообщений.</span>
+                            </div>
                         </div>
                     </div>
-                    <p class="hint">Экспортировать логи расширения для отладки проблем.</p>
+
+                    <hr>
+
+                    <div class="iig-settings-card">
+                        <h4>Обработка ошибок</h4>
+                    
+                        <div class="flex-row">
+                            <label for="iig_max_retries">Макс. повторов</label>
+                            <input type="number" id="iig_max_retries" class="text_pole flex1" 
+                                   value="${settings.maxRetries}" min="0" max="5">
+                        </div>
+                        <div class="flex-row">
+                            <label for="iig_retry_delay">Задержка (мс)</label>
+                            <input type="number" id="iig_retry_delay" class="text_pole flex1" 
+                                   value="${settings.retryDelay}" min="500" max="10000" step="500">
+                        </div>
+                    </div>
+
+                    <div class="iig-settings-card">
+                        <h4>Отладка</h4>
+                        <div class="flex-row">
+                            <div id="iig_export_logs" class="menu_button" style="width: 100%;">
+                                <i class="fa-solid fa-download"></i> Экспорт логов
+                            </div>
+                        </div>
+                        <p class="hint">Экспортировать логи расширения для отладки проблем.</p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1771,23 +2450,36 @@ function bindSettingsEvents() {
 
         // Model is used for OpenAI and Gemini; Naistera does not need a model.
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
+        document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
+        document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((isNaistera || isGemini) && settings.imageContextEnabled));
 
         // OpenAI-only params
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
         document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
 
         // Naistera-only params
+        document.getElementById('iig_naistera_model_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_preset_row')?.classList.toggle('iig-hidden', !isNaistera);
+        document.getElementById('iig_naistera_video_section')?.classList.toggle('iig-hidden', !isNaistera);
+        document.getElementById('iig_naistera_video_frequency_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraVideoTest));
         document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
 
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
 
+        const endpointInput = document.getElementById('iig_endpoint');
+        if (endpointInput) {
+            endpointInput.placeholder = getEndpointPlaceholder(apiType);
+        }
+
         // Avatar section is only for Gemini/nano-banana
         const avatarSection = document.getElementById('iig_avatar_section');
         if (avatarSection) {
             avatarSection.classList.toggle('hidden', !isGemini);
+        }
+        const avatarRefsSection = document.getElementById('iig_avatar_refs_section');
+        if (avatarRefsSection) {
+            avatarRefsSection.classList.toggle('hidden', !isGemini);
         }
     };
     
@@ -1796,10 +2488,41 @@ function bindSettingsEvents() {
         settings.enabled = e.target.checked;
         saveSettings();
     });
+
+    document.getElementById('iig_external_blocks')?.addEventListener('change', (e) => {
+        settings.externalBlocks = e.target.checked;
+        saveSettings();
+    });
+
+    document.getElementById('iig_image_context_enabled')?.addEventListener('change', (e) => {
+        settings.imageContextEnabled = e.target.checked;
+        saveSettings();
+        updateVisibility();
+    });
+
+    document.getElementById('iig_image_context_count')?.addEventListener('input', (e) => {
+        const normalized = normalizeImageContextCount(e.target.value);
+        settings.imageContextCount = normalized;
+        e.target.value = String(normalized);
+        saveSettings();
+    });
     
     // API Type
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
-        settings.apiType = e.target.value;
+        const nextApiType = e.target.value;
+        const endpointInput = document.getElementById('iig_endpoint');
+        if (shouldReplaceEndpointForApiType(nextApiType, settings.endpoint)) {
+            settings.endpoint = normalizeConfiguredEndpoint(nextApiType, '');
+            if (endpointInput) {
+                endpointInput.value = settings.endpoint;
+            }
+        } else if (nextApiType === 'naistera') {
+            settings.endpoint = normalizeConfiguredEndpoint(nextApiType, settings.endpoint);
+            if (endpointInput) {
+                endpointInput.value = settings.endpoint;
+            }
+        }
+        settings.apiType = nextApiType;
         saveSettings();
         updateVisibility();
     });
@@ -1897,14 +2620,27 @@ function bindSettingsEvents() {
     });
 
     // Naistera aspect ratio
+    document.getElementById('iig_naistera_model')?.addEventListener('change', (e) => {
+        settings.naisteraModel = normalizeNaisteraModel(e.target.value);
+        saveSettings();
+    });
+
+    // Naistera aspect ratio
     document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => {
         settings.naisteraAspectRatio = e.target.value;
         saveSettings();
     });
 
-    // Naistera preset
-    document.getElementById('iig_naistera_preset')?.addEventListener('change', (e) => {
-        settings.naisteraPreset = e.target.value;
+    document.getElementById('iig_naistera_video_test')?.addEventListener('change', (e) => {
+        settings.naisteraVideoTest = e.target.checked;
+        saveSettings();
+        updateVisibility();
+    });
+
+    document.getElementById('iig_naistera_video_every_n')?.addEventListener('input', (e) => {
+        const normalized = normalizeNaisteraVideoFrequency(e.target.value);
+        settings.naisteraVideoEveryN = normalized;
+        e.target.value = String(normalized);
         saveSettings();
     });
 
