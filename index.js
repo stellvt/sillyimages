@@ -1034,14 +1034,31 @@ async function generateImageNaistera(prompt, style, options = {}) {
         body.video_test_every_n_messages = videoEveryN;
     }
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${settings.apiKey}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-    });
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${settings.apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(body)
+        });
+    } catch (error) {
+        const pageOrigin = window.location.origin;
+        let endpointOrigin = endpoint;
+        try {
+            endpointOrigin = new URL(url, window.location.href).origin;
+        } catch (parseErr) {
+            console.warn('[IIG] Failed to parse Naistera endpoint origin:', parseErr);
+        }
+        const rawMessage = String(error?.message || '').trim() || 'Failed to fetch';
+        throw new Error(
+            `Network/CORS error while requesting ${endpointOrigin} from ${pageOrigin}. `
+            + `The browser blocked access to the response before the API could return JSON. `
+            + `Original error: ${rawMessage}`
+        );
+    }
 
     if (!response.ok) {
         const text = await response.text();
@@ -2185,7 +2202,7 @@ function createSettingsUI() {
                         <select id="iig_api_type" class="flex1">
                             <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
                             <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
-                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera/Grok (naistera.org)</option>
+                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (naistera.org)</option>
                         </select>
                     </div>
                     
