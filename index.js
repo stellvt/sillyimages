@@ -62,6 +62,7 @@ const defaultSettings = Object.freeze({
     // Nano-banana specific
     sendCharAvatar: false,
     sendUserAvatar: false,
+    useActiveUserPersonaAvatar: false,
     userAvatarFile: '', // Selected user avatar filename from /User Avatars/
     aspectRatio: '1:1', // "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
     imageSize: '1K', // "1K", "2K", "4K"
@@ -76,6 +77,12 @@ const defaultSettings = Object.freeze({
 
 const MAX_CONTEXT_IMAGES = 3;
 const MAX_GENERATION_REFERENCE_IMAGES = 5;
+const PERSONAS_MODULE_PATHS = Object.freeze([
+    '/scripts/personas.js',
+    '../../../personas.js',
+]);
+
+let personasModulePromise = null;
 
 // Image model detection keywords (from your api_client.py)
 const IMAGE_MODEL_KEYWORDS = [
@@ -444,6 +451,18 @@ function getUserAvatarSelects() {
         .filter(Boolean);
 }
 
+function getActivePersonaAvatarCheckboxes() {
+    return ['iig_use_active_persona_avatar', 'iig_naistera_use_active_persona_avatar']
+        .map((id) => document.getElementById(id))
+        .filter(Boolean);
+}
+
+function syncActivePersonaAvatarMode(enabled) {
+    for (const checkbox of getActivePersonaAvatarCheckboxes()) {
+        checkbox.checked = Boolean(enabled);
+    }
+}
+
 function syncUserAvatarSelection(selectedAvatar) {
     for (const select of getUserAvatarSelects()) {
         if (selectedAvatar && !Array.from(select.options).some((option) => option.value === selectedAvatar)) {
@@ -475,6 +494,23 @@ async function refreshUserAvatarSelects() {
     const avatars = await fetchUserAvatars();
     populateUserAvatarSelects(avatars, getSettings().userAvatarFile);
     return avatars;
+}
+
+async function loadPersonasModule() {
+    if (!personasModulePromise) {
+        personasModulePromise = (async () => {
+            let lastError = null;
+            for (const modulePath of PERSONAS_MODULE_PATHS) {
+                try {
+                    return await import(modulePath);
+                } catch (error) {
+                    lastError = error;
+                }
+            }
+            throw lastError || new Error('Unable to import personas.js');
+        })();
+    }
+    return await personasModulePromise;
 }
 
 /**
@@ -825,20 +861,61 @@ async function getCharacterAvatarDataUrl() {
 }
 
 /**
+ * Resolve currently selected user avatar URL.
+ */
+async function getSelectedUserAvatarUrl() {
+    const settings = getSettings();
+
+    if (settings.useActiveUserPersonaAvatar) {
+        try {
+            const personasModule = await loadPersonasModule();
+            const activeAvatarId = String(personasModule?.user_avatar || '').trim();
+            if (!activeAvatarId) {
+                console.log('[IIG] No active user persona avatar selected');
+                if (!settings.userAvatarFile) {
+                    return null;
+                }
+            } else {
+                if (typeof personasModule?.getUserAvatar === 'function') {
+                    const resolved = String(personasModule.getUserAvatar(activeAvatarId) || '').trim();
+                    if (resolved) {
+                        const normalized = resolved.replace(/^\/+/, '');
+                        console.log('[IIG] Using active user persona avatar:', normalized);
+                        return `/${normalized}`;
+                    }
+                }
+
+                const fallback = `/User Avatars/${encodeURIComponent(activeAvatarId)}`;
+                console.log('[IIG] Falling back to active user persona avatar path:', fallback);
+                return fallback;
+            }
+        } catch (error) {
+            console.error('[IIG] Failed to resolve active user persona avatar:', error);
+            if (!settings.userAvatarFile) {
+                return null;
+            }
+        }
+    }
+
+    if (!settings.userAvatarFile) {
+        console.log('[IIG] No user avatar selected in settings');
+        return null;
+    }
+
+    const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
+    console.log('[IIG] Using selected user avatar:', avatarUrl);
+    return avatarUrl;
+}
+
+/**
  * Get user avatar as base64 (full resolution, not thumbnail)
  */
 async function getUserAvatarBase64() {
     try {
-        const settings = getSettings();
-        
-        // Use selected avatar from settings (user's choice)
-        if (!settings.userAvatarFile) {
-            console.log('[IIG] No user avatar selected in settings');
+        const avatarUrl = await getSelectedUserAvatarUrl();
+        if (!avatarUrl) {
             return null;
         }
-        
-        const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
-        console.log('[IIG] Using selected user avatar:', avatarUrl);
         return await imageUrlToBase64(avatarUrl);
     } catch (error) {
         console.error('[IIG] Error getting user avatar:', error);
@@ -1023,15 +1100,14 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
 
 /**
  * Get user avatar as data URL (for Naistera references)
- * Reuses the same selected user avatar file as Gemini settings.
+ * Uses either the active persona avatar or the manually selected file.
  */
 async function getUserAvatarDataUrl() {
     try {
-        const settings = getSettings();
-        if (!settings.userAvatarFile) {
+        const avatarUrl = await getSelectedUserAvatarUrl();
+        if (!avatarUrl) {
             return null;
         }
-        const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
         return await imageUrlToDataUrl(avatarUrl);
     } catch (error) {
         console.error('[IIG] Error getting user avatar data URL:', error);
@@ -2502,7 +2578,11 @@ function createSettingsUI() {
                             <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
                             <span>Отправлять аватар {{user}}</span>
                         </label>
-                        <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}" style="margin-top: 5px;">
+                        <label id="iig_naistera_use_active_persona_avatar_row" class="checkbox_label ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}">
+                            <input type="checkbox" id="iig_naistera_use_active_persona_avatar" ${settings.useActiveUserPersonaAvatar ? 'checked' : ''}>
+                            <span>Брать аватар из активной персоны {{user}}</span>
+                        </label>
+                        <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar || settings.useActiveUserPersonaAvatar ? 'iig-hidden' : ''}" style="margin-top: 5px;">
                             <label for="iig_naistera_user_avatar_file">Аватар {{user}}</label>
                             <select id="iig_naistera_user_avatar_file" class="flex1">
                                 <option value="">-- Не выбран --</option>
@@ -2525,7 +2605,11 @@ function createSettingsUI() {
                             <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
                             <span>Отправлять аватар {{user}}</span>
                         </label>
-                        <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
+                        <label id="iig_use_active_persona_avatar_row" class="checkbox_label ${!settings.sendUserAvatar ? 'hidden' : ''}">
+                            <input type="checkbox" id="iig_use_active_persona_avatar" ${settings.useActiveUserPersonaAvatar ? 'checked' : ''}>
+                            <span>Брать аватар из активной персоны {{user}}</span>
+                        </label>
+                        <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar || settings.useActiveUserPersonaAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
                             <label for="iig_user_avatar_file">Аватар {{user}}</label>
                             <select id="iig_user_avatar_file" class="flex1">
                                 <option value="">-- Не выбран --</option>
@@ -2624,7 +2708,11 @@ function bindSettingsEvents() {
         document.getElementById('iig_naistera_video_section')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_video_frequency_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraVideoTest));
         document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
+        document.getElementById('iig_naistera_use_active_persona_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
+        document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle(
+            'iig-hidden',
+            !(isNaistera && settings.naisteraSendUserAvatar && !settings.useActiveUserPersonaAvatar)
+        );
 
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
 
@@ -2642,6 +2730,11 @@ function bindSettingsEvents() {
         if (avatarRefsSection) {
             avatarRefsSection.classList.toggle('hidden', !isGemini);
         }
+        document.getElementById('iig_use_active_persona_avatar_row')?.classList.toggle('hidden', !(isGemini && settings.sendUserAvatar));
+        document.getElementById('iig_user_avatar_row')?.classList.toggle(
+            'hidden',
+            !(isGemini && settings.sendUserAvatar && !settings.useActiveUserPersonaAvatar)
+        );
     };
     
     // Enable toggle
@@ -2816,6 +2909,13 @@ function bindSettingsEvents() {
         updateVisibility();
     });
 
+    document.getElementById('iig_naistera_use_active_persona_avatar')?.addEventListener('change', (e) => {
+        settings.useActiveUserPersonaAvatar = e.target.checked;
+        syncActivePersonaAvatarMode(settings.useActiveUserPersonaAvatar);
+        saveSettings();
+        updateVisibility();
+    });
+
     // Naistera user avatar file selection (reuses settings.userAvatarFile)
     document.getElementById('iig_naistera_user_avatar_file')?.addEventListener('change', (e) => {
         settings.userAvatarFile = e.target.value;
@@ -2849,12 +2949,14 @@ function bindSettingsEvents() {
     document.getElementById('iig_send_user_avatar')?.addEventListener('change', (e) => {
         settings.sendUserAvatar = e.target.checked;
         saveSettings();
-        
-        // Show/hide avatar selection row
-        const avatarRow = document.getElementById('iig_user_avatar_row');
-        if (avatarRow) {
-            avatarRow.classList.toggle('hidden', !e.target.checked);
-        }
+        updateVisibility();
+    });
+
+    document.getElementById('iig_use_active_persona_avatar')?.addEventListener('change', (e) => {
+        settings.useActiveUserPersonaAvatar = e.target.checked;
+        syncActivePersonaAvatarMode(settings.useActiveUserPersonaAvatar);
+        saveSettings();
+        updateVisibility();
     });
     
     // User avatar file selection
@@ -2899,6 +3001,7 @@ function bindSettingsEvents() {
 
     // Apply initial state
     syncUserAvatarSelection(settings.userAvatarFile);
+    syncActivePersonaAvatarMode(settings.useActiveUserPersonaAvatar);
     updateVisibility();
 }
 
