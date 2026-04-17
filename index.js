@@ -68,7 +68,7 @@ const defaultSettings = Object.freeze({
     imageSize: '1K', // "1K", "2K", "4K"
     // Naistera specific
     naisteraAspectRatio: '1:1',
-    naisteraModel: 'grok', // 'grok' | 'nano banana 2' | 'novelai'
+    naisteraModel: 'grok', // 'grok' | 'grok-pro' | 'nano banana 2' | 'novelai'
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
     naisteraVideoTest: false,
@@ -133,7 +133,7 @@ function isGeminiModel(modelId) {
     return mid.includes('nano-banana');
 }
 
-const NAISTERA_MODELS = Object.freeze(['grok', 'nano banana 2', 'novelai']);
+const NAISTERA_MODELS = Object.freeze(['grok', 'grok-pro', 'nano banana 2', 'novelai']);
 const DEFAULT_ENDPOINTS = Object.freeze({
     naistera: 'https://naistera.org',
 });
@@ -146,8 +146,13 @@ const ENDPOINT_PLACEHOLDERS = Object.freeze({
 function normalizeNaisteraModel(model) {
     const raw = String(model || '').trim().toLowerCase();
     if (!raw) return 'grok';
+    if (raw === 'grok pro') return 'grok-pro';
+    if (raw === 'grok-pro') return 'grok-pro';
+    if (raw === 'grok-imagine-pro') return 'grok-pro';
+    if (raw === 'imagine-pro') return 'grok-pro';
     if (raw === 'nano-banana') return 'nano banana 2';
     if (raw === 'nano banana') return 'nano banana 2';
+    // Legacy value migration: map removed "nano banana pro" to "nano banana 2".
     if (raw === 'nano-banana-pro') return 'nano banana 2';
     if (raw === 'nano banana pro') return 'nano banana 2';
     if (raw === 'nano-banana-2') return 'nano banana 2';
@@ -159,12 +164,13 @@ function normalizeNaisteraModel(model) {
 }
 
 function naisteraModelSupportsReferences(model) {
-    return normalizeNaisteraModel(model) !== 'novelai';
+    const normalized = normalizeNaisteraModel(model);
+    return normalized !== 'novelai' && normalized !== 'grok-pro';
 }
 
 function shouldUseNaisteraVideoTest(model) {
     const normalized = normalizeNaisteraModel(model);
-    return normalized === 'grok' || normalized.startsWith('nano banana');
+    return normalized === 'grok' || normalized === 'grok-pro' || normalized.startsWith('nano banana');
 }
 
 function normalizeNaisteraVideoFrequency(value) {
@@ -1400,7 +1406,7 @@ function validateSettings() {
     if (settings.apiType === 'naistera') {
         const m = normalizeNaisteraModel(settings.naisteraModel);
         if (!NAISTERA_MODELS.includes(m)) {
-            errors.push('Для Naistera выберите модель: grok / nano banana');
+            errors.push('Для Naistera выберите модель: grok / grok-pro / nano banana');
         }
     }
     
@@ -2675,7 +2681,7 @@ function createSettingsUI() {
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
-                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / nano banana / novelai).</p>
+                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / grok-pro / nano banana / novelai).</p>
                     
                     <!-- Модель -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
@@ -2715,6 +2721,7 @@ function createSettingsUI() {
                             <label for="iig_naistera_model">Модель</label>
                             <select id="iig_naistera_model" class="flex1">
                                 <option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>grok</option>
+                                <option value="grok-pro" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok-pro' ? 'selected' : ''}>grok-pro</option>
                                 <option value="nano banana 2" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana 2' ? 'selected' : ''}>nano banana 2</option>
                                 <option value="novelai" ${normalizeNaisteraModel(settings.naisteraModel) === 'novelai' ? 'selected' : ''}>novelai</option>
                             </select>
